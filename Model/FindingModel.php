@@ -2,6 +2,7 @@
 
 namespace Kanboard\Plugin\Gumshoe\Model;
 
+use Kanboard\Plugin\Gumshoe\Inventory\Dependency;
 use PDO;
 use PDOStatement;
 use RuntimeException;
@@ -56,16 +57,122 @@ final class FindingModel
         )->fetchColumn() !== false;
     }
 
-    public function recordExposure(array $match, int $now): int
+    public function hasLockfiles(int $repoId): bool
     {
-        $identity = [$match['group_id'], $match['ecosystem'], $match['package']];
-        $select = 'SELECT id FROM gumshoe_findings WHERE group_id = ? AND ecosystem = ? AND package = ?';
-        $findingId = $this->execute($select, $identity)->fetchColumn();
-        if ($findingId === false) {
-            $this->execute('INSERT INTO gumshoe_findings (group_id, ecosystem, package) VALUES (?, ?, ?)', $identity);
-            $findingId = $this->execute($select, $identity)->fetchColumn();
+        return $this->execute('SELECT 1 FROM gumshoe_lockfiles WHERE repo_id = ? LIMIT 1', [$repoId])->fetchColumn() !== false;
+    }
+
+    /** Consolidate persisted group merges, including merges discovered before this run. */
+    public function mergeAbsorbedFindings(): array
+    {
+        $absorbed = $this->execute(
+            "SELECT f.id, f.group_id, f.ecosystem, f.package, f.status, g.merged_into
+             FROM gumshoe_findings f JOIN gumshoe_groups g ON g.id = f.group_id
+             WHERE g.merged_into IS NOT NULL AND f.status <> 'merged' ORDER BY f.id",
+            [],
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $statusRank = ['fixed' => 0, 'dismissed' => 1, 'open' => 2];
+        $transitions = [];
+        foreach ($absorbed as $finding) {
+            $id = (int) $finding['id'];
+            $groupId = $this->survivingGroup((int) $finding['group_id'], (int) $finding['merged_into']);
+            $survivor = $this->findOrCreate($groupId, $finding['ecosystem'], $finding['package'], $finding['status']);
+            $survivorId = (int) $survivor['id'];
+            if ($statusRank[$finding['status']] > $statusRank[$survivor['status']]) {
+                $this->execute('UPDATE gumshoe_findings SET status = ? WHERE id = ?', [$finding['status'], $survivorId]);
+            }
+
+            $this->moveExposures($id, $survivorId);
+            $this->moveRepos($id, $survivorId);
+            $this->execute("UPDATE gumshoe_findings SET status = 'merged' WHERE id = ?", [$id]);
+            $transitions[$id] = ['from' => $finding['status'], 'to' => 'merged', 'survivor_finding_id' => $survivorId];
         }
 
+        return $transitions;
+    }
+
+    private function survivingGroup(int $groupId, int $target): int
+    {
+        $visited = [$groupId => true];
+        while (!isset($visited[$target])) {
+            $visited[$target] = true;
+            $next = $this->execute('SELECT merged_into FROM gumshoe_groups WHERE id = ?', [$target])->fetchColumn();
+            if ($next === null) {
+                return $target;
+            }
+            if ($next === false) {
+                break;
+            }
+            $target = (int) $next;
+        }
+
+        throw new RuntimeException('Invalid advisory group merge chain.');
+    }
+
+    private function moveExposures(int $absorbedId, int $survivorId): void
+    {
+        $rows = $this->execute('SELECT * FROM gumshoe_exposures WHERE finding_id = ?', [$absorbedId])->fetchAll(PDO::FETCH_ASSOC);
+        $where = 'finding_id = ? AND repo_id = ? AND lockfile_id = ? AND version = ?';
+        foreach ($rows as $row) {
+            $identity = [$row['repo_id'], $row['lockfile_id'], $row['version']];
+            $existing = $this->execute('SELECT active, first_seen, last_seen FROM gumshoe_exposures WHERE '.$where, [$survivorId, ...$identity])
+                ->fetch(PDO::FETCH_ASSOC);
+            if ($existing === false) {
+                $this->execute('UPDATE gumshoe_exposures SET finding_id = ? WHERE '.$where, [$survivorId, $absorbedId, ...$identity]);
+                continue;
+            }
+
+            $this->execute(
+                'UPDATE gumshoe_exposures SET active = ?, first_seen = ?, last_seen = ? WHERE '.$where,
+                [
+                    (int) ($row['active'] || $existing['active']),
+                    min($row['first_seen'], $existing['first_seen']),
+                    max($row['last_seen'], $existing['last_seen']),
+                    $survivorId, ...$identity,
+                ],
+            );
+            $this->execute('DELETE FROM gumshoe_exposures WHERE '.$where, [$absorbedId, ...$identity]);
+        }
+    }
+
+    private function moveRepos(int $absorbedId, int $survivorId): void
+    {
+        $stateRank = ['fixed' => 0, 'unknown' => 1, 'affected' => 2];
+        $rows = $this->execute('SELECT * FROM gumshoe_finding_repos WHERE finding_id = ?', [$absorbedId])->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($rows as $row) {
+            $repoId = (int) $row['repo_id'];
+            $existing = $this->execute(
+                'SELECT state, ever_affected FROM gumshoe_finding_repos WHERE finding_id = ? AND repo_id = ?',
+                [$survivorId, $repoId],
+            )->fetch(PDO::FETCH_ASSOC);
+            $state = $row['state'];
+            if ($existing !== false && $stateRank[$existing['state']] > $stateRank[$state]) {
+                $state = $existing['state'];
+            }
+
+            // A subtask ID belongs to the original task. Keep only the survivor's ID.
+            $this->writeRepoState($survivorId, $repoId, $state, $row['ever_affected'] || !empty($existing['ever_affected']), $existing !== false);
+        }
+        $this->execute('DELETE FROM gumshoe_finding_repos WHERE finding_id = ?', [$absorbedId]);
+    }
+
+    private function findOrCreate(int $groupId, string $ecosystem, string $package, string $status = 'open'): array
+    {
+        $identity = [$groupId, $ecosystem, $package];
+        $select = 'SELECT id, status FROM gumshoe_findings WHERE group_id = ? AND ecosystem = ? AND package = ?';
+        $row = $this->execute($select, $identity)->fetch(PDO::FETCH_ASSOC);
+        if ($row === false) {
+            $this->execute('INSERT INTO gumshoe_findings (group_id, ecosystem, package, status) VALUES (?, ?, ?, ?)', [...$identity, $status]);
+            $row = $this->execute($select, $identity)->fetch(PDO::FETCH_ASSOC);
+        }
+
+        return $row;
+    }
+
+    public function recordExposure(array $match, int $now): int
+    {
+        $findingId = (int) $this->findOrCreate($match['group_id'], $match['ecosystem'], $match['package'])['id'];
         $key = [$findingId, $match['repo_id'], $match['lockfile_id'], $match['version']];
         $where = 'finding_id = ? AND repo_id = ? AND lockfile_id = ? AND version = ?';
         if ($this->execute('SELECT 1 FROM gumshoe_exposures WHERE '.$where, $key)->fetchColumn() === false) {
@@ -78,7 +185,7 @@ final class FindingModel
             $this->execute('UPDATE gumshoe_exposures SET active = 1, last_seen = ? WHERE '.$where, [$now, ...$key]);
         }
 
-        return (int) $findingId;
+        return $findingId;
     }
 
     public function forRepo(int $repoId): array
@@ -105,18 +212,18 @@ final class FindingModel
     public function hasCompleteAnswers(int $runId, int $repoId, array $exposure): bool
     {
         // An unfinished query for the previously exposed version can still change the match set.
+        $queryType = $exposure['ecosystem'] === 'actions' ? Dependency::QUERY_COMMIT : Dependency::QUERY_PACKAGE;
         $unfinished = $this->execute(
             "SELECT 1 FROM gumshoe_pending
-             WHERE run_id = ? AND ecosystem = ? AND name = ? AND version = ?
-               AND egress = 'public' AND state <> 'done' LIMIT 1",
-            [$runId, $exposure['ecosystem'], $exposure['package'], $exposure['version']],
+             WHERE run_id = ? AND query_type = ? AND ecosystem = ? AND name = ? AND version = ?
+               AND egress = 'public' AND (state <> 'done' OR retry_at IS NOT NULL OR page_token IS NOT NULL) LIMIT 1",
+            [$runId, $queryType, $exposure['ecosystem'], $exposure['package'], $exposure['version']],
         )->fetchColumn();
         if ($unfinished !== false) {
             return false;
         }
 
-        // Current public versions of this package need answers too. A retained exposed version
-        // that lost public evidence is a coverage gap, so absence from Matcher proves nothing.
+        // Current public versions of this package need answers too.
         return $this->execute(
             "SELECT 1 FROM gumshoe_lockfiles l JOIN gumshoe_deps d ON d.lockfile_id = l.id
              LEFT JOIN gumshoe_pending p ON p.run_id = ? AND p.query_type = d.query_type
@@ -127,6 +234,16 @@ final class FindingModel
              LIMIT 1",
             [$runId, $repoId, $exposure['ecosystem'], $exposure['package'], $exposure['version']],
         )->fetchColumn() === false;
+    }
+
+    public function hasInstalledVersion(int $repoId, array $exposure): bool
+    {
+        return $this->execute(
+            'SELECT 1 FROM gumshoe_lockfiles l JOIN gumshoe_deps d ON d.lockfile_id = l.id
+             WHERE l.repo_id = ? AND l.id = ? AND d.ecosystem = ? AND d.name = ? AND d.version = ?
+             LIMIT 1',
+            [$repoId, $exposure['lockfile_id'], $exposure['ecosystem'], $exposure['package'], $exposure['version']],
+        )->fetchColumn() !== false;
     }
 
     public function retireExposure(int $repoId, array $exposure): void
@@ -140,16 +257,21 @@ final class FindingModel
 
     public function setRepoState(int $findingId, int $repoId, string $state, ?array $previous): void
     {
-        $everAffected = (int) ($state === 'affected' || !empty($previous['ever_affected']));
-        if ($previous === null) {
+        $this->writeRepoState($findingId, $repoId, $state, $state === 'affected' || !empty($previous['ever_affected']), $previous !== null);
+    }
+
+    private function writeRepoState(int $findingId, int $repoId, string $state, bool $everAffected, bool $exists): void
+    {
+        $values = [$state, (int) $everAffected, $findingId, $repoId];
+        if (!$exists) {
             $this->execute(
                 'INSERT INTO gumshoe_finding_repos (state, ever_affected, finding_id, repo_id) VALUES (?, ?, ?, ?)',
-                [$state, $everAffected, $findingId, $repoId],
+                $values,
             );
         } else {
             $this->execute(
                 'UPDATE gumshoe_finding_repos SET state = ?, ever_affected = ? WHERE finding_id = ? AND repo_id = ?',
-                [$state, $everAffected, $findingId, $repoId],
+                $values,
             );
         }
     }

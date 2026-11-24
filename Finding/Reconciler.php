@@ -17,8 +17,9 @@ final readonly class Reconciler
      * supplied to Matcher are complete. The hourly job uses positive matches only.
      *
      * @param list<array{group_id: int, ecosystem: string, package: string, repo_id: int, lockfile_id: int, version: string}> $matches
-     * @return array<int, array{from: ?string, to: string, ever_affected: bool, comment: ?string}>
-     *     Transitions keyed by finding ID for the board sync. The comment is text for a new unknown transition.
+     * @return array<int, array{from: ?string, to: string, was_ever_affected: bool, comment: ?string}
+     *     |array{from: string, to: 'merged', survivor_finding_id: int}>
+     *     Transitions keyed by finding ID for the board sync.
      */
     public function apply(
         int $runId,
@@ -30,15 +31,16 @@ final readonly class Reconciler
     ): array {
         return $this->findings->transaction(function () use ($runId, $repoId, $outcome, $matches, $advisorySourcesComplete, $now): array {
             $context = $this->findings->context($runId, $repoId);
+            $merges = $this->findings->mergeAbsorbedFindings();
             if (!(int) $context['enabled']) {
-                return [];
+                return $merges;
             }
 
             $inventory = $context['job'] === 'gumshoe.inventory';
             $previous = $this->findings->forRepo($repoId);
             if (in_array($inventory ? $outcome : $context['outcome'], ['inaccessible', 'out_of_watch'], true)) {
                 if (!$inventory) {
-                    return [];
+                    return $merges;
                 }
                 $comment = $context['owner'].'/'.$context['repo']." is no longer scanned ($outcome); its status is unknown.";
                 $states = array_fill_keys(array_keys($previous), 'unknown');
@@ -48,7 +50,7 @@ final readonly class Reconciler
                     }
                 }
 
-                return $this->applyStates($repoId, $previous, $states, $comment);
+                return $merges + $this->applyStates($repoId, $previous, $states, $comment);
             }
 
             $seen = [];
@@ -62,17 +64,27 @@ final readonly class Reconciler
                 $states[$findingId] = 'affected';
             }
 
-            if ($inventory && $outcome === 'complete' && $advisorySourcesComplete && !$this->findings->hasIncompleteLockfiles($repoId)) {
+            if ($inventory && $advisorySourcesComplete && $this->hasCompleteInventory($repoId, $outcome, $context['outcome'])) {
                 foreach ($this->resolvedFindings($runId, $repoId, $seen) as $findingId) {
                     $states[$findingId] = 'fixed';
                 }
             }
 
-            return $this->applyStates($repoId, $previous, $states);
+            return $merges + $this->applyStates($repoId, $previous, $states);
         });
     }
 
-    /** Retire only unmatched exposures with complete answers, then aggregate by repo. */
+    private function hasCompleteInventory(int $repoId, ?string $outcome, ?string $storedOutcome): bool
+    {
+        if ($outcome === 'no_lockfile') {
+            // InventoryStore currently persists an empty complete tree as 'complete'.
+            return in_array($storedOutcome, ['complete', 'no_lockfile'], true) && !$this->findings->hasLockfiles($repoId);
+        }
+
+        return $outcome === 'complete' && $storedOutcome === 'complete' && !$this->findings->hasIncompleteLockfiles($repoId);
+    }
+
+    /** Retire only absent versions with complete answers, then aggregate by repo. */
     private function resolvedFindings(int $runId, int $repoId, array $seen): array
     {
         $stillActive = [];
@@ -80,6 +92,7 @@ final readonly class Reconciler
         foreach ($this->findings->activeExposures($repoId) as $exposure) {
             $findingId = $exposure['finding_id'];
             if (isset($seen[$findingId][$exposure['lockfile_id']][$exposure['version']])
+                || $this->findings->hasInstalledVersion($repoId, $exposure)
                 || !$this->findings->hasCompleteAnswers($runId, $repoId, $exposure)) {
                 $stillActive[$findingId] = true;
                 continue;
@@ -106,7 +119,7 @@ final readonly class Reconciler
             $transitions[$findingId] = [
                 'from' => $from,
                 'to' => $state,
-                'ever_affected' => !empty($row['ever_affected']),
+                'was_ever_affected' => !empty($row['ever_affected']),
                 'comment' => $comment,
             ];
         }
