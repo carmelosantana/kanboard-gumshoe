@@ -20,6 +20,8 @@ final readonly class Policy
     }
 
     /**
+     * Inferred pnpm evidence requires the recorded registry configuration.
+     *
      * @param array<string, string>|string $registryConfig TreeReader's registry host map or 'unknown'.
      */
     public function verdict(
@@ -45,8 +47,7 @@ final readonly class Policy
         $public = match ($dep->ecosystem) {
             'composer' => $dep->registry_evidence === 'packagist',
             'npm' => $dep->registry_evidence === 'npmjs'
-                && in_array($lockfileKind, ['npm', 'pnpm'], true)
-                && (!$dep->evidence_inferred || self::usesNpmDefault($name, $registryConfig)),
+                && (!$dep->evidence_inferred || ($lockfileKind === 'pnpm' && self::usesNpmDefault($name, $registryConfig))),
             'actions' => ($this->githubVisibility[$name] ?? null) === true,
         };
 

@@ -30,7 +30,7 @@ final class EgressPolicyTest extends TestCase
         array $denyPrefixes = [],
     ): void {
         $dep = new Dependency($ecosystem, $name, $version, 'prod', null, $queryType, $evidence);
-        self::assertSame($expected, (new Policy($denyPrefixes))->verdict($dep, $ecosystem));
+        self::assertSame($expected, (new Policy($denyPrefixes))->verdict($dep));
     }
 
     public static function packageCases(): iterable
@@ -118,10 +118,12 @@ final class EgressPolicyTest extends TestCase
         self::assertSame('private', $policy->verdict($result->deps[1], 'pnpm', []));
     }
 
-    public function testNpmEvidenceWithUnknownLockfileKindIsPrivate(): void
+    public function testInferredNpmEvidenceRequiresPnpmRegistryConfig(): void
     {
-        $dep = new Dependency('npm', 'lodash', '1.0.0', 'prod', null, 'package', 'npmjs');
-        self::assertSame('private', (new Policy())->verdict($dep));
+        $dep = new Dependency('npm', 'lodash', '1.0.0', 'prod', null, 'package', 'npmjs', evidence_inferred: true);
+        $policy = new Policy();
+        self::assertSame('private', $policy->verdict($dep));
+        self::assertSame('private', $policy->verdict($dep, 'npm', []));
     }
 
     public function testClassificationDoesNotSendHttpRequests(): void
