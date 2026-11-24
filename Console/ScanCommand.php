@@ -60,21 +60,6 @@ final class ScanCommand extends BaseCommand
                 $output->writeln('<error>Resume the other Gumshoe job before running this job.</error>');
                 return self::FAILURE;
             }
-
-            // An unbounded scan can still pause for an advisory or Vault retry.
-            // Give up the lease between slices and check the persisted retry time.
-            do {
-                $remaining = (int) ($active['retry_at'] ?? 0) - time();
-                sleep(max(1, min(60, $remaining)));
-                $active = $log->latest($job);
-            } while ($active !== null && $active['status'] === 'more' && (int) $active['retry_at'] > time());
-
-            if (($active['status'] ?? null) === 'ok') {
-                return self::SUCCESS;
-            }
-            if (($active['status'] ?? null) === 'failed') {
-                return self::FAILURE;
-            }
         }
     }
 }

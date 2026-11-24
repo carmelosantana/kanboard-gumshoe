@@ -90,11 +90,13 @@ final class ScanSlice
                 return $more;
             }
             if (!($claimed = $this->lease->claim($this->holder, self::TTL))) {
+                $waitUntil = $this->deadline ?? PHP_INT_MAX;
                 return $busy;
             }
             $active = $this->log->active();
             if ($active !== null && $active['job'] !== $job
                 && !($active['job'] === Jobs::RECHECK && !(int) $this->settings['hourly'])) {
+                $waitUntil = $this->deadline ?? PHP_INT_MAX;
                 return $more;
             }
             $latest = $this->log->latest($job);
@@ -152,6 +154,7 @@ final class ScanSlice
             return $more;
         } catch (Throwable $failure) {
             if (!$claimed && $failure instanceof PDOException && self::claimContended($failure)) {
+                $waitUntil = $this->deadline ?? PHP_INT_MAX;
                 return $busy;
             }
             if (!isset($this->run)) {
@@ -239,16 +242,19 @@ final class ScanSlice
 
         $token = $this->tokens->status($owner['login']);
         $retryAt = $listing['retryAt'] ?? $token['retryAt'];
-        $canRetry = $retryAt !== null || ($token['status'] !== 'missing' && !str_starts_with($token['status'], 'refused:'));
-        return $this->write(function () use ($owner, $listing, $id, $retryAt, $canRetry): bool {
+        $tokenUnavailable = $token['status'] === 'missing' || str_starts_with($token['status'], 'refused:');
+        return $this->write(function () use ($owner, $listing, $id, $retryAt, $tokenUnavailable): bool {
             $this->saveTokenStatus($owner);
             if ($listing['status'] !== 'complete') {
-                if ($canRetry && $this->run['exception_class'] === null) {
+                if (($retryAt !== null || !$tokenUnavailable) && $this->run['exception_class'] === null) {
                     return $this->backoff(HttpFailure::class, $retryAt);
                 }
                 $counts = $this->log->counts($this->id());
                 $counts['failed_owners'][] = $id;
                 $counts['owner_retry_at'] = max($counts['owner_retry_at'] ?? 0, $this->retryTime($retryAt));
+                if (!$tokenUnavailable) {
+                    $counts['listing_failed'] = true;
+                }
                 $this->log->saveCounts($this->id(), $counts);
             } else {
                 (new RepoModel($this->pdo))->applyListing($id, $listing, ($this->clock)());
@@ -277,9 +283,12 @@ final class ScanSlice
         }
 
         $id = (int) $repo['id'];
+        $counts = $this->log->counts($this->id());
+        if (in_array((int) $repo['owner_id'], $counts['failed_owners'] ?? [], true)) {
+            return $this->write(fn () => $this->advance('inventory', $id + 1));
+        }
         $this->selectPosition($id);
         $rules = new WatchRules($this->settings, ($this->clock)());
-        $counts = $this->log->counts($this->id());
         $outcome = 'out_of_watch';
         $scan = null;
         if ($rules->watched($repo, $repo)) {
@@ -429,6 +438,10 @@ final class ScanSlice
         $runId = $this->id();
         $id = (int) $repo['id'];
         $inventory = $this->run['job'] === Jobs::INVENTORY;
+        $counts = $this->log->counts($runId);
+        if (in_array((int) $repo['owner_id'], $counts['failed_owners'] ?? [], true)) {
+            return $this->write(fn () => $this->advance('match', $id + 1));
+        }
         $pending = $this->rows(
             "SELECT DISTINCT p.* FROM gumshoe_pending p
              JOIN gumshoe_deps d ON p.query_type = d.query_type AND p.ecosystem = d.ecosystem
@@ -455,13 +468,12 @@ final class ScanSlice
             unset($dep);
         }
 
-        return $this->write(function () use ($id, $repo, $inventory, $pending, $deps, $matches, $runId): bool {
+        return $this->write(function () use ($id, $repo, $inventory, $pending, $deps, $matches, $runId, $counts): bool {
             $result = (new Matcher(new GroupStore($this->pdo)))->exposures($deps, $pending, $this->osvResults, $matches);
             $transitions = (new Reconciler(new FindingModel($this->pdo)))->apply(
                 $runId, $id, $inventory ? $repo['outcome'] : null, $result['exposures'], $inventory, ($this->clock)(),
             );
             $this->saveTransitions($transitions, $id);
-            $counts = $this->log->counts($runId);
             $counts['coverage_gaps'] = ($counts['coverage_gaps'] ?? 0) + ($result['coverage_gaps'][$id] ?? 0);
             $this->log->saveCounts($runId, $counts);
             return $this->advance('match', $id + 1);
@@ -477,9 +489,9 @@ final class ScanSlice
         if ($finding === false) {
             return $this->write(function (): bool {
                 $counts = $this->log->counts($this->id());
-                $failed = !empty($counts['failed_owners']);
+                $failed = !empty($counts['listing_failed']);
                 $this->advance('done');
-                $this->finish($failed ? 'failed' : 'ok', $failed ? HttpFailure::class : null, $counts['owner_retry_at'] ?? null);
+                $this->finish($failed ? 'failed' : 'ok', $failed ? HttpFailure::class : null, $failed ? $counts['owner_retry_at'] : null);
                 if (!$failed && $this->run['job'] === Jobs::INVENTORY) {
                     $this->log->purge(($this->clock)());
                 }

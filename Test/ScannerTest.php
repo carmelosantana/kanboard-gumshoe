@@ -482,13 +482,36 @@ final class ScannerTest extends Base
     {
         $lease = new WriterLease($this->pdo, fn (): int => $this->now);
         self::assertTrue($lease->claim('other-writer', 60));
-        $scanner = $this->scanner();
-        foreach ([self::INVENTORY, self::RECHECK] as $job) {
-            self::assertSame('more', $scanner->tick($job, 'web')['status']);
-        }
+        $sleeps = [];
+        $scanner = $this->scanner(sleeper: static function (int $seconds) use (&$sleeps): void {
+            $sleeps[] = $seconds;
+        });
+        self::assertSame('more', $scanner->tick(self::INVENTORY, 'web')['status']);
+        self::assertSame([], $sleeps);
+        self::assertSame('more', $scanner->tick(self::RECHECK, 'cli', $this->now + 2)['status']);
+        self::assertSame([2], $sleeps);
         self::assertSame([], $this->requests);
         self::assertSame([], (new RunLog($this->pdo))->recent());
         self::assertTrue($lease->release('other-writer'));
+    }
+
+    public function testCliWaitsForTheOtherJobWithoutHoldingTheLease(): void
+    {
+        $log = new RunLog($this->pdo);
+        $run = $log->start(self::INVENTORY, 'web', 'discover', $this->now);
+        $sleeps = [];
+        $lease = new WriterLease($this->pdo, fn (): int => $this->now);
+        $scanner = $this->scanner(sleeper: static function (int $seconds) use (&$sleeps, $lease): void {
+            self::assertTrue($lease->claim('waiting-test', 60));
+            self::assertTrue($lease->release('waiting-test'));
+            $sleeps[] = $seconds;
+        });
+        self::assertSame('more', $scanner->tick(self::RECHECK, 'web')['status']);
+        self::assertSame([], $sleeps);
+        self::assertSame('more', $scanner->tick(self::RECHECK, 'cli')['status']);
+        self::assertSame([5], $sleeps);
+        self::assertSame([], $this->requests);
+        self::assertSame([$run], $log->recent());
     }
 
     /** @dataProvider vaultPrerequisites */
@@ -518,6 +541,42 @@ final class ScannerTest extends Base
     private function removeVault(): void
     {
         unset($this->container['vaultSecrets']);
+    }
+
+    public function testMissingOwnerTokenPreservesItsRepoAndLetsTheRunSucceed(): void
+    {
+        $this->pdo->exec("INSERT INTO gumshoe_owners (login, kind) VALUES ('php', 'org')");
+        $this->pdo->exec("INSERT INTO gumshoe_repos (owner_id, name, github_id, mode, outcome, last_complete_at)
+            SELECT id, 'php-src', 2, 'pin', 'complete', 1 FROM gumshoe_owners WHERE login = 'php'");
+
+        self::assertSame('done', $this->scanner()->tick(self::INVENTORY, 'foreman')['status']);
+        $run = $this->latest();
+        self::assertSame('ok', $run['status']);
+        self::assertNull($run['retry_at']);
+        self::assertNull($run['exception_class']);
+        $counts = json_decode($run['counts'], true);
+        self::assertCount(1, $counts['failed_owners']);
+        self::assertSame(1, $counts['complete']);
+        self::assertSame(['php-src' => 'complete', 'yaml' => 'complete'], $this->pdo
+            ->query('SELECT name, outcome FROM gumshoe_repos ORDER BY name')->fetchAll(PDO::FETCH_KEY_PAIR));
+        self::assertSame(1, (int) $this->pdo->query("SELECT last_complete_at FROM gumshoe_repos WHERE name = 'php-src'")->fetchColumn());
+        self::assertSame('missing', $this->pdo->query("SELECT token_status FROM gumshoe_owners WHERE login = 'php'")->fetchColumn());
+    }
+
+    public function testOwnerListingFailureAfterRetryFailsEvenWhenTheOtherOwnerWasScanned(): void
+    {
+        $this->pdo->exec("INSERT INTO gumshoe_owners (login, kind, token_ref) VALUES ('php', 'org', 'vault://18/token')");
+        $scanner = $this->scanner(fn (Request $request): Response => $request->operation === 'gh.list' && $request->owner === 'php'
+            ? new Response(503, ['Retry-After' => '120'])
+            : $this->respond($request));
+
+        self::assertSame('more', $scanner->tick(self::INVENTORY, 'foreman')['status']);
+        $this->now = (int) $this->latest()['retry_at'];
+        self::assertSame('failed', $scanner->tick(self::INVENTORY, 'foreman')['status']);
+        $run = $this->latest();
+        self::assertSame('failed', $run['status']);
+        self::assertGreaterThan($this->now, (int) $run['retry_at']);
+        self::assertSame(1, json_decode($run['counts'], true)['complete']);
     }
 
     public function testVaultRefusalForEveryOwnerFailsWithoutAnUnauthenticatedListing(): void
