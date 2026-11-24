@@ -28,6 +28,10 @@ class Plugin extends Base
         foreach ($actions as $action => $path) {
             $this->route->addRoute('settings/gumshoe/sources'.$path, 'SourcesController', $action, 'Gumshoe');
         }
+        $this->applicationAccessMap->add('RunController', ['index'], Role::APP_ADMIN);
+        $this->applicationAccessMap->add('RepoController', ['show'], Role::APP_ADMIN);
+        $this->route->addRoute('settings/gumshoe/run-log', 'RunController', 'index', 'Gumshoe');
+        $this->route->addRoute('settings/gumshoe/repos/:repo_id', 'RepoController', 'show', 'Gumshoe');
         $this->hook->on('template:config:sidebar', ['template' => 'Gumshoe:config/sidebar']);
 
         $this->hook->on('foreman:jobs', static function () use ($container): array {
