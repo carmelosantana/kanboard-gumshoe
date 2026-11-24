@@ -1,0 +1,218 @@
+<?php
+
+namespace Kanboard\Plugin\Gumshoe\Schema;
+
+use PDO;
+
+const VERSION = 1;
+
+function version_1(PDO $pdo): void
+{
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_settings (
+            watch_id INTEGER NOT NULL PRIMARY KEY CHECK (watch_id = 1),
+            window_days INTEGER NOT NULL DEFAULT 90,
+            forks INTEGER NOT NULL DEFAULT 0,
+            archived INTEGER NOT NULL DEFAULT 0,
+            scanning INTEGER NOT NULL DEFAULT 1,
+            hourly INTEGER NOT NULL DEFAULT 1,
+            project_id INTEGER,
+            deny_prefixes TEXT NOT NULL DEFAULT '',
+            revision INTEGER NOT NULL DEFAULT 0
+        )
+        SQL);
+    $pdo->exec('INSERT INTO gumshoe_settings (watch_id) VALUES (1)');
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_owners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            watch_id INTEGER NOT NULL DEFAULT 1,
+            login VARCHAR(39) NOT NULL,
+            kind VARCHAR(8) NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            token_ref TEXT,
+            token_status VARCHAR(16) NOT NULL DEFAULT 'missing',
+            token_expires_at BIGINT,
+            UNIQUE (watch_id, login)
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_repos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            name VARCHAR(100) NOT NULL,
+            github_id BIGINT NOT NULL UNIQUE,
+            mode VARCHAR(8) NOT NULL DEFAULT 'auto',
+            private INTEGER NOT NULL DEFAULT 0,
+            fork INTEGER NOT NULL DEFAULT 0,
+            archived INTEGER NOT NULL DEFAULT 0,
+            pushed_at BIGINT,
+            default_branch TEXT,
+            head_sha VARCHAR(64),
+            tree_sha VARCHAR(64),
+            outcome VARCHAR(16),
+            last_complete_at BIGINT,
+            gone_at BIGINT,
+            UNIQUE (owner_id, name),
+            FOREIGN KEY (owner_id) REFERENCES gumshoe_owners (id) ON DELETE CASCADE
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_lockfiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo_id INTEGER NOT NULL,
+            path_hash VARCHAR(64) NOT NULL,
+            path VARCHAR(1024) NOT NULL CHECK (length(path) <= 1024),
+            blob_sha VARCHAR(64) NOT NULL,
+            kind VARCHAR(16) NOT NULL,
+            status VARCHAR(16) NOT NULL,
+            parser_version INTEGER NOT NULL,
+            last_complete_blob_sha VARCHAR(64),
+            UNIQUE (repo_id, path_hash)
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_deps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lockfile_id INTEGER NOT NULL,
+            ecosystem VARCHAR(32) NOT NULL,
+            name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            scope VARCHAR(16) NOT NULL,
+            source TEXT,
+            query_type VARCHAR(16) NOT NULL DEFAULT 'none',
+            egress VARCHAR(16) NOT NULL DEFAULT 'unqueryable',
+            FOREIGN KEY (lockfile_id) REFERENCES gumshoe_lockfiles (id) ON DELETE CASCADE
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_dep_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            repo_id INTEGER NOT NULL,
+            kind VARCHAR(16) NOT NULL,
+            ecosystem VARCHAR(32),
+            name TEXT,
+            from_version TEXT,
+            to_version TEXT,
+            path TEXT,
+            created_at BIGINT NOT NULL
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            primary_id VARCHAR(255) NOT NULL,
+            cvss_max DOUBLE PRECISION,
+            malware INTEGER NOT NULL DEFAULT 0,
+            kev INTEGER NOT NULL DEFAULT 0,
+            merged_into INTEGER
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_group_aliases (
+            alias VARCHAR(255) NOT NULL UNIQUE,
+            group_id INTEGER NOT NULL,
+            FOREIGN KEY (group_id) REFERENCES gumshoe_groups (id)
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_advisory_cache (
+            source VARCHAR(16) NOT NULL,
+            advisory_id VARCHAR(255) NOT NULL,
+            modified VARCHAR(64),
+            body TEXT NOT NULL,
+            fetched_at BIGINT NOT NULL,
+            UNIQUE (source, advisory_id)
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            ecosystem VARCHAR(32) NOT NULL,
+            package VARCHAR(512) NOT NULL,
+            task_id INTEGER,
+            project_id INTEGER,
+            priority VARCHAR(8) NOT NULL DEFAULT 'normal',
+            status VARCHAR(16) NOT NULL DEFAULT 'open',
+            closed_by_gumshoe_at BIGINT,
+            last_synced_at BIGINT,
+            UNIQUE (group_id, ecosystem, package)
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_finding_repos (
+            finding_id INTEGER NOT NULL,
+            repo_id INTEGER NOT NULL,
+            subtask_id INTEGER,
+            state VARCHAR(8) NOT NULL DEFAULT 'unknown',
+            ever_affected INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (finding_id, repo_id)
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_exposures (
+            finding_id INTEGER NOT NULL,
+            repo_id INTEGER NOT NULL,
+            lockfile_id INTEGER NOT NULL,
+            version VARCHAR(191) NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            first_seen BIGINT NOT NULL,
+            last_seen BIGINT NOT NULL,
+            UNIQUE (finding_id, repo_id, lockfile_id, version)
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_pending (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER NOT NULL,
+            query_type VARCHAR(16) NOT NULL,
+            ecosystem VARCHAR(32) NOT NULL,
+            name VARCHAR(512) NOT NULL,
+            version VARCHAR(191) NOT NULL,
+            egress VARCHAR(16) NOT NULL DEFAULT 'unqueryable',
+            state VARCHAR(16) NOT NULL DEFAULT 'pending',
+            page_token TEXT,
+            retry_at BIGINT,
+            UNIQUE (run_id, query_type, ecosystem, name, version)
+        )
+        SQL);
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_state (
+            name VARCHAR(32) NOT NULL PRIMARY KEY,
+            holder VARCHAR(128),
+            lease_until BIGINT NOT NULL DEFAULT 0,
+            run_id INTEGER
+        )
+        SQL);
+    $pdo->exec("INSERT INTO gumshoe_state (name) VALUES ('writer')");
+
+    $pdo->exec(<<<'SQL'
+        CREATE TABLE gumshoe_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job VARCHAR(32) NOT NULL,
+            "trigger" VARCHAR(16) NOT NULL,
+            phase VARCHAR(16) NOT NULL DEFAULT 'discover',
+            position TEXT,
+            status VARCHAR(8) NOT NULL DEFAULT 'more',
+            counts TEXT NOT NULL DEFAULT '{}',
+            exception_class VARCHAR(255),
+            retry_at BIGINT,
+            started_at BIGINT NOT NULL,
+            finished_at BIGINT
+        )
+        SQL);
+}

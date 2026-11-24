@@ -1,0 +1,23 @@
+{
+    "name": "Gumshoe",
+    "description": "Watch GitHub lockfiles for vulnerable dependencies and malware, and track findings in Kanboard.",
+    "version": "1.0.0",
+    "author": "Carmelo Santana",
+    "license": "MIT",
+    "homepage": "https://github.com/carmelosantana/kanboard-gumshoe",
+    "kanboard_version": ">=1.2.47",
+    "php_version": ">=8.4",
+    "requires": [
+        {
+            "plugin": "Vault",
+            "min_version": "1.1.0",
+            "reason": "Holds GitHub tokens with Server sharing enabled. Gumshoe stores only Vault references."
+        }
+    ],
+    "recommends": [
+        {
+            "plugin": "Foreman",
+            "reason": "Runs Gumshoe scans on a schedule."
+        }
+    ]
+}
