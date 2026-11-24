@@ -91,3 +91,12 @@ match the ecosystem's name grammar and no admin deny prefix (`denied`). Everythi
 
 | Finding | Severity | Owner task | Test | Fix commit |
 |---|---|---|---|---|
+| S1. Self-asserted lockfile provenance: a hostile lockfile pairs a private name and arbitrary printable `version` with a `registry.npmjs.org` `resolved` URL (likewise Composer `notification-url`, pnpm registry metadata) and gets `public`, so name and version reach `api.osv.dev` | High | 8 (with 3, 4) | pending | pending |
+| S2. An 8 MiB `.npmrc` of newlines exhausts PHP memory in `preg_split()` (`GitHub/TreeReader.php:307-334`); fatal, uncatchable, blocks every later repo | High | 7 | pending | pending |
+| S3. A 7 MiB package-lock v3 with 180,000 entries exhausts 128 MiB in `json_decode` before the row cap applies; pnpm builds its whole row map first | High | 3, 4 | pending | pending |
+| S4. A merge relinks and reopens after a person deleted the survivor's task (`Finding/BoardSync.php:426`, `:467`) | Medium | 13 | pending | pending |
+| S5. Interrupted create plus a person's move or delete duplicates or recreates the task (`BoardSync.php:193`, `:226`) | Medium | 13 | pending | pending |
+| S6. Escalation after deletion recreates the task on a newly configured board, not the finding's own (`BoardSync.php:68`, `:97`) | Medium | 13 | pending | pending |
+| S7. Hourly recheck reuses stored `public` verdicts for Actions without fresh visibility (`Run/ScanSlice.php:555`) | Low | 14 | pending | pending |
+
+Review: Codex `gpt-5.6-sol` with `--cyber-access-program daybreak_blue` (requested and accepted by codex-cli 0.171.0; served program not exposed by the CLI), read-only, on `7f2fcf2`, 2026-11-24. No critical findings. Token path, HTTP authority/redirects/pagination, public-board safety, controller ACL/CSRF, XSS and YAML object injection: no critical or high finding.
