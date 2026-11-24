@@ -28,12 +28,10 @@ final class InventoryStore
      *         registryConfig?: array<string, string>|'unknown'
      *     }>
      * } $scan
-     * @param ?Policy $policy The current run's deny prefixes and GitHub visibility observations.
+     * @param Policy $policy The current run's deny prefixes and GitHub visibility observations.
      */
-    public function apply(int $runId, int $repoId, array $scan, ?Policy $policy = null): void
+    public function apply(int $runId, int $repoId, array $scan, Policy $policy): void
     {
-        $defaultPolicy = $policy === null;
-        $policy ??= new Policy();
         $this->pdo->beginTransaction();
         try {
             $repo = $this->execute('SELECT last_complete_at FROM gumshoe_repos WHERE id = ?', [$repoId])
@@ -56,15 +54,6 @@ final class InventoryStore
                 $result = $file['result'];
                 $unchanged = $stored !== null && $stored['status'] === 'ok' && $file['blob_sha'] === $stored['blob_sha']
                     && $file['kind'] === $stored['kind'] && $file['parser_version'] === (int) $stored['parser_version'];
-                // The default policy can reuse cached verdicts for static evidence unless a prior policy denied a row.
-                if ($unchanged && !$result instanceof ParseResult && $defaultPolicy
-                    && !in_array($file['kind'], ['pnpm', 'actions'], true)
-                    && $this->execute(
-                        "SELECT 1 FROM gumshoe_deps WHERE lockfile_id = ? AND egress = 'denied' LIMIT 1",
-                        [$stored['id']],
-                    )->fetchColumn() === false) {
-                    continue;
-                }
 
                 if (!$result instanceof ParseResult) {
                     $result = $result();

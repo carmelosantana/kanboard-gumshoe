@@ -64,26 +64,6 @@ final class InventoryStoreTest extends Base
         self::assertSame($this->sha('f'), $this->rows('repos')[0]['tree_sha']);
     }
 
-    public function testReusesSuccessfulParseUntilParserVersionChanges(): void
-    {
-        $calls = 0;
-        $parse = function () use (&$calls): ParseResult {
-            ++$calls;
-            return $this->parsed('4.0.0');
-        };
-
-        $this->apply(1, [$this->file('a', $parse)]);
-        self::assertSame(1, $calls);
-        $before = $this->rows('deps');
-        $this->apply(2, [$this->file('a', $parse)]);
-        self::assertSame(1, $calls);
-        self::assertSame($before, $this->rows('deps'));
-        $this->apply(3, [$this->file('a', $parse, parserVersion: 2)]);
-        self::assertSame(2, $calls);
-        self::assertSame(2, (int) $this->rows('lockfiles')[0]['parser_version']);
-        self::assertSame(['new_repo'], array_column($this->rows('dep_changes'), 'kind'));
-    }
-
     public function testStoresPnpmVerdictsUsingEachLockfilesRegistryConfig(): void
     {
         $result = PnpmLock::parse(<<<'YAML'
@@ -120,14 +100,23 @@ final class InventoryStoreTest extends Base
         self::assertSame(['denied'], array_column($this->rows('deps'), 'egress'));
     }
 
-    public function testRemovingDenyPrefixRefreshesAnUnchangedLazyLockfile(): void
+    public function testAddingDenyPrefixRefreshesAnUnchangedLockfile(): void
     {
         $file = $this->file('a', fn (): ParseResult => $this->parsed('4.0.0'));
-        $this->apply(1, [$file], policy: new Policy(['universal-user-']));
-        self::assertSame(['denied'], array_column($this->rows('deps'), 'egress'));
-
-        $this->apply(2, [$file]);
+        $this->apply(1, [$file]);
         self::assertSame(['public'], array_column($this->rows('deps'), 'egress'));
+
+        $this->apply(2, [$file], policy: new Policy(['universal-user-']));
+        self::assertSame(['denied'], array_column($this->rows('deps'), 'egress'));
+        self::assertSame(['new_repo'], array_column($this->rows('dep_changes'), 'kind'));
+    }
+
+    public function testApplyRequiresExplicitPolicy(): void
+    {
+        $this->expectException(\ArgumentCountError::class);
+        $this->store->apply(1, 1, [
+            'treeComplete' => true, 'headSha' => $this->sha('1'), 'treeSha' => $this->sha('f'), 'files' => [],
+        ]);
     }
 
     public function testIncompleteParseKeepsLastCompleteRowsAndIsRetried(): void
@@ -216,7 +205,7 @@ final class InventoryStoreTest extends Base
         self::assertSame(['new_repo', 'changed'], array_column($this->rows('dep_changes'), 'kind'));
     }
 
-    private function apply(int $runId, array $files, bool $treeComplete = true, ?Policy $policy = null): void
+    private function apply(int $runId, array $files, bool $treeComplete = true, Policy $policy = new Policy()): void
     {
         $this->store->apply($runId, 1, [
             'treeComplete' => $treeComplete, 'headSha' => $this->sha((string) $runId), 'treeSha' => $this->sha('f'),

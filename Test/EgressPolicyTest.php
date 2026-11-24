@@ -28,21 +28,27 @@ final class EgressPolicyTest extends TestCase
         ?string $version = '1.0.0',
         string $queryType = 'package',
         array $denyPrefixes = [],
+        ?string $lockfileKind = 'npm',
     ): void {
         $dep = new Dependency($ecosystem, $name, $version, 'prod', null, $queryType, $evidence);
-        self::assertSame($expected, (new Policy($denyPrefixes))->verdict($dep));
+        self::assertSame($expected, (new Policy($denyPrefixes))->verdict($dep, $lockfileKind));
     }
 
     public static function packageCases(): iterable
     {
         yield 'npm scope and maximum version' => ['public', 'npm', '@types/node', 'npmjs', str_repeat('1', 128)];
         yield 'npm maximum name' => ['public', 'npm', str_repeat('a', 214), 'npmjs'];
-        yield 'composer allows double hyphen in package' => ['public', 'composer', 'symfony/yaml--example', 'packagist'];
+        yield 'composer allows double hyphen in package' => ['public', 'composer', 'symfony/yaml--example', 'packagist', '1.0.0', 'package', [], 'composer'];
+        yield 'npm evidence from another lockfile kind' => ['private', 'npm', 'lodash', 'npmjs', '1.0.0', 'package', [], 'yarn'];
+        yield 'npm evidence without a lockfile kind' => ['private', 'npm', 'lodash', 'npmjs', '1.0.0', 'package', [], null];
         yield 'missing npm evidence' => ['private', 'npm', 'lodash', null];
         yield 'missing composer evidence' => ['private', 'composer', 'symfony/yaml', null];
         yield 'unrecognized evidence' => ['private', 'npm', 'lodash', 'example.org'];
         yield 'registry must match ecosystem' => ['private', 'npm', 'lodash', 'packagist'];
         yield 'deny prefix' => ['denied', 'npm', '@types/node', 'npmjs', '1.0.0', 'package', ['@actions/', '@types/']];
+        yield 'mixed-case deny prefix' => ['denied', 'npm', '@types/node', 'npmjs', '1.0.0', 'package', ['@Types/']];
+        yield 'deny prefix with surrounding whitespace' => ['denied', 'npm', '@types/node', 'npmjs', '1.0.0', 'package', [" \t@types/\n"]];
+        yield 'blank deny prefixes' => ['public', 'npm', '@types/node', 'npmjs', '1.0.0', 'package', ['', " \t"]];
         yield 'prefix only matches at start' => ['public', 'npm', '@types/node', 'npmjs', '1.0.0', 'package', ['node']];
         yield 'npm uppercase' => ['unqueryable', 'npm', 'Lodash', 'npmjs'];
         yield 'npm trailing newline' => ['unqueryable', 'npm', "lodash\n", 'npmjs'];

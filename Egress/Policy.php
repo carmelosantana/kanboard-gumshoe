@@ -8,15 +8,26 @@ final readonly class Policy
 {
     private const NPM_REGISTRY = 'registry.npmjs.org';
 
+    /** @var list<string> */
+    private array $denyPrefixes;
+
     /**
      * @param list<string> $denyPrefixes
      * @param array<string, bool|null> $githubVisibility Current-run GitHub observations keyed by lowercase owner/repo.
      *                                                  True means GitHub explicitly reported the repo public.
      */
     public function __construct(
-        private array $denyPrefixes = [],
+        array $denyPrefixes = [],
         private array $githubVisibility = [],
     ) {
+        $prefixes = [];
+        foreach ($denyPrefixes as $prefix) {
+            $prefix = strtolower(trim($prefix));
+            if ($prefix !== '') {
+                $prefixes[] = $prefix;
+            }
+        }
+        $this->denyPrefixes = $prefixes;
     }
 
     /**
@@ -39,7 +50,7 @@ final readonly class Policy
         }
 
         foreach ($this->denyPrefixes as $prefix) {
-            if ($prefix !== '' && str_starts_with($name, $prefix)) {
+            if (str_starts_with($name, $prefix)) {
                 return 'denied';
             }
         }
@@ -47,6 +58,7 @@ final readonly class Policy
         $public = match ($dep->ecosystem) {
             'composer' => $dep->registry_evidence === 'packagist',
             'npm' => $dep->registry_evidence === 'npmjs'
+                && in_array($lockfileKind, ['npm', 'pnpm'], true)
                 && (!$dep->evidence_inferred || ($lockfileKind === 'pnpm' && self::usesNpmDefault($name, $registryConfig))),
             'actions' => ($this->githubVisibility[$name] ?? null) === true,
         };
