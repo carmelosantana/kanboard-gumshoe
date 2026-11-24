@@ -2,6 +2,9 @@
 
 namespace Kanboard\Plugin\Gumshoe\Test;
 
+use Kanboard\Plugin\Gumshoe\Egress\Policy;
+use Kanboard\Plugin\Gumshoe\Inventory\ParseResult;
+use Kanboard\Plugin\Gumshoe\Model\InventoryStore;
 use KanboardTests\units\Base;
 use PDO;
 use PDOException;
@@ -35,7 +38,6 @@ class SchemaTest extends Base
         $this->assertRow($pdo, 'settings', ['project_id' => 7, 'deny_prefixes' => '@example/', 'revision' => 2]);
 
         $path = str_repeat('a/', 507).'Abcde.lock';
-        $otherPath = strtolower($path);
         $run = [
             'id' => 1, 'job' => 'gumshoe.inventory', 'trigger' => 'cli', 'phase' => 'inventory',
             'position' => '{"repo_id":1}', 'status' => 'more', 'counts' => '{"complete":1}',
@@ -100,12 +102,6 @@ class SchemaTest extends Base
             $this->insert($pdo, $table, $row);
             $this->assertRow($pdo, $table, $row);
         }
-        $alternateLockfile = array_replace($rows['lockfiles'], [
-            'id' => 2, 'path_hash' => hash('sha256', $otherPath), 'path' => $otherPath,
-        ]);
-        $this->insert($pdo, 'lockfiles', $alternateLockfile);
-        $this->assertRow($pdo, 'lockfiles', $alternateLockfile, 'WHERE id = 2');
-        $this->assertSame(1, (int) $pdo->query('SELECT COUNT(*) FROM gumshoe_lockfiles WHERE path = '.$pdo->quote($path))->fetchColumn());
         $pdo->exec("UPDATE gumshoe_state SET holder = 'slice-1', lease_until = 1700000060, run_id = 1 WHERE name = 'writer'");
         $this->assertRow($pdo, 'state', ['holder' => 'slice-1', 'lease_until' => 1700000060, 'run_id' => 1]);
 
@@ -136,6 +132,70 @@ class SchemaTest extends Base
         $this->assertSame(0, (int) $pdo->query('SELECT COUNT(*) FROM gumshoe_deps')->fetchColumn());
         $pdo->exec('DELETE FROM gumshoe_owners WHERE id = 1');
         $this->assertSame(0, (int) $pdo->query('SELECT COUNT(*) FROM gumshoe_repos')->fetchColumn());
+    }
+
+    public function testVersion1Indexes(): void
+    {
+        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
+        $pdo = $this->container['db']->getConnection();
+        version_1($pdo);
+
+        $sql = match (DB_DRIVER) {
+            'sqlite' => 'SELECT info.name
+                FROM pragma_index_list(?) AS indexes
+                JOIN pragma_index_info(indexes.name) AS info ON info.seqno = 0
+                WHERE indexes.partial = 0',
+            'mysql' => 'SELECT COLUMN_NAME FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND SEQ_IN_INDEX = 1 AND SUB_PART IS NULL',
+            'postgres' => 'SELECT attribute.attname
+                FROM pg_index AS indexes
+                JOIN pg_class AS relations ON relations.oid = indexes.indrelid
+                JOIN pg_attribute AS attribute ON attribute.attrelid = relations.oid AND attribute.attnum = indexes.indkey[0]
+                WHERE relations.relname = ? AND pg_table_is_visible(relations.oid)
+                  AND indexes.indisvalid AND indexes.indpred IS NULL',
+        };
+        $statement = $pdo->prepare($sql);
+        foreach ([
+            'gumshoe_deps' => 'lockfile_id',
+            'gumshoe_dep_changes' => 'repo_id',
+            'gumshoe_finding_repos' => 'repo_id',
+            'gumshoe_exposures' => 'repo_id',
+        ] as $table => $column) {
+            $statement->execute([$table]);
+            $this->assertContains($column, $statement->fetchAll(PDO::FETCH_COLUMN), "$table($column)");
+        }
+    }
+
+    public function testStorePreservesLockfilePathsAndRejectsOverlongPaths(): void
+    {
+        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
+        $pdo = $this->container['db']->getConnection();
+        version_1($pdo);
+        $pdo->exec("INSERT INTO gumshoe_owners (login, kind) VALUES ('symfony', 'org')");
+        $pdo->exec("INSERT INTO gumshoe_repos (owner_id, name, github_id) VALUES (1, 'yaml', 1)");
+
+        $prefix = str_repeat('a/', 504);
+        $paths = [$prefix.'Ab/composer.lock', $prefix.'ab/composer.lock'];
+        $file = [
+            'blob_sha' => str_repeat('c', 40), 'kind' => 'composer', 'parser_version' => 1,
+            'result' => new ParseResult([]),
+        ];
+        $store = new InventoryStore($pdo);
+        $policy = new Policy();
+        $scan = [
+            'treeComplete' => false, 'headSha' => null, 'treeSha' => null,
+            'files' => array_map(static fn (string $path): array => ['path' => $path] + $file, $paths),
+        ];
+        $store->apply(1, 1, $scan, $policy);
+
+        $rows = $pdo->query('SELECT path, path_hash FROM gumshoe_lockfiles WHERE repo_id = 1 ORDER BY id')
+            ->fetchAll(PDO::FETCH_ASSOC);
+        $this->assertSame($paths, array_column($rows, 'path'));
+        $this->assertSame(array_map(static fn (string $path): string => hash('sha256', $path), $paths), array_column($rows, 'path_hash'));
+
+        $scan['files'] = [['path' => 'x'.$paths[0]] + $file];
+        $this->expectException(PDOException::class);
+        $store->apply(2, 1, $scan, $policy);
     }
 
     private function insert(PDO $pdo, string $table, array $row): void

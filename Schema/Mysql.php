@@ -220,4 +220,8 @@ function version_1(PDO $pdo): void
             finished_at BIGINT
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin ROW_FORMAT=DYNAMIC
         SQL);
+
+    $pdo->exec('CREATE INDEX gumshoe_dep_changes_repo_id ON gumshoe_dep_changes (repo_id)');
+    $pdo->exec('CREATE INDEX gumshoe_finding_repos_repo_id ON gumshoe_finding_repos (repo_id)');
+    $pdo->exec('CREATE INDEX gumshoe_exposures_repo_id ON gumshoe_exposures (repo_id)');
 }

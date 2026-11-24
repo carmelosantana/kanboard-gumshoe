@@ -220,4 +220,9 @@ function version_1(PDO $pdo): void
             finished_at BIGINT
         )
         SQL);
+
+    $pdo->exec('CREATE INDEX gumshoe_deps_lockfile_id ON gumshoe_deps (lockfile_id)');
+    $pdo->exec('CREATE INDEX gumshoe_dep_changes_repo_id ON gumshoe_dep_changes (repo_id)');
+    $pdo->exec('CREATE INDEX gumshoe_finding_repos_repo_id ON gumshoe_finding_repos (repo_id)');
+    $pdo->exec('CREATE INDEX gumshoe_exposures_repo_id ON gumshoe_exposures (repo_id)');
 }

@@ -18,6 +18,10 @@
         {
             "plugin": "Foreman",
             "reason": "Runs Gumshoe scans on a schedule."
+        },
+        {
+            "plugin": "Harbor",
+            "reason": "Suite design system the Gumshoe pages are styled with; core styles are used without it."
         }
     ]
 }

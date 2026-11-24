@@ -28,8 +28,8 @@ class PluginTest extends TestCase
         $this->assertMatchesRegularExpression('/^\d+\.\d+\.\d+$/D', $vault['min_version']);
         $this->assertNotSame('', trim($vault['reason']));
 
-        $this->assertCount(1, $manifest['recommends']);
-        $this->assertSame(['Foreman'], array_column($manifest['recommends'], 'plugin'));
+        $this->assertCount(2, $manifest['recommends']);
+        $this->assertSame(['Foreman', 'Harbor'], array_column($manifest['recommends'], 'plugin'));
     }
 
     private function manifest(): array
