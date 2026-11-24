@@ -24,6 +24,8 @@ final class WatchRulesTest extends TestCase
             [1, ['archived' => 1], false, 'archived'],
             [1, [], true, 'pushed 90d ago'],
             [1, ['pushed_at' => $now - 91 * 86400], false, 'idle 91d'],
+            [1, ['gone_at' => $now, 'mode' => 'exclude'], false, ''],
+            [0, ['gone_at' => $now, 'mode' => 'pin'], false, ''],
         ] as [$enabled, $changes, $watched, $reason]) {
             $owner = ['enabled' => $enabled];
             self::assertSame($reason, $rules->reason($owner, $changes + $repo));

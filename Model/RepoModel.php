@@ -36,7 +36,9 @@ final class RepoModel
             if ($owner->fetchColumn() !== $listing['owner']) {
                 throw new RuntimeException('Discovery snapshot does not match the watch owner.');
             }
-            $missing = array_column($this->forOwner($ownerId), 'id', 'github_id');
+            $incomingIds = array_fill_keys(array_column($listing['repos'], 'github_id'), true);
+            $incomingNames = array_fill_keys(array_map(strtolower(...), array_column($listing['repos'], 'name')), true);
+            $markGone = $this->pdo->prepare('UPDATE gumshoe_repos SET gone_at = ? WHERE id = ? AND gone_at IS NULL');
 
             $insert = $this->pdo->prepare(
                 'INSERT INTO gumshoe_repos (owner_id, name, private, fork, archived, pushed_at, default_branch, github_id)
@@ -48,6 +50,16 @@ final class RepoModel
             );
             $find = $this->pdo->prepare('SELECT name FROM gumshoe_repos WHERE github_id = ?');
             $freeName = $this->pdo->prepare('UPDATE gumshoe_repos SET name = ? WHERE github_id = ?');
+            foreach ($this->forOwner($ownerId) as $old) {
+                if (!isset($incomingIds[$old['github_id']])) {
+                    $markGone->execute([$now, $old['id']]);
+                    if (isset($incomingNames[strtolower($old['name'])])) {
+                        // GitHub names cannot contain ~. Keep the row and its history by GitHub id.
+                        $suffix = '~gone~'.$old['github_id'];
+                        $freeName->execute([substr($old['name'], 0, 100 - strlen($suffix)).$suffix, $old['github_id']]);
+                    }
+                }
+            }
             $existing = [];
             foreach ($listing['repos'] as $repo) {
                 $githubId = $repo['github_id'];
@@ -70,12 +82,6 @@ final class RepoModel
                 ];
 
                 (isset($existing[$githubId]) ? $update : $insert)->execute($values);
-                unset($missing[$githubId]);
-            }
-
-            $markGone = $this->pdo->prepare('UPDATE gumshoe_repos SET gone_at = ? WHERE id = ? AND gone_at IS NULL');
-            foreach ($missing as $repoId) {
-                $markGone->execute([$now, $repoId]);
             }
 
             if ($ownsTransaction) {

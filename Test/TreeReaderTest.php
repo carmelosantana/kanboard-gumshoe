@@ -78,12 +78,13 @@ final class TreeReaderTest extends TestCase
 
     public function testSortsBeforeApplyingTheFiftyFileCap(): void
     {
+        $workflow = $this->entry('.github/workflows/ci.yml', 51);
         $entries = [];
         for ($i = 0; $i < 51; ++$i) {
             $entries[] = $this->entry(sprintf('%02d/composer.lock', $i), $i);
         }
         [$reader, $transport] = $this->reader([
-            $this->branch(), $this->tree(array_reverse($entries)),
+            $this->branch(), $this->tree([$workflow, ...array_reverse($entries)]),
             ...array_fill(0, 50, new Response(200, [], '{"packages":[]}')),
         ]);
         $scan = $reader->read(self::OWNER, self::REPO);
@@ -92,6 +93,7 @@ final class TreeReaderTest extends TestCase
         self::assertSame(array_column(array_slice($entries, 0, 50), 'path'), array_column($scan['files'], 'path'));
         self::assertCount(52, $transport->requests);
         self::assertNotContains(self::BASE.'/git/blobs/'.$entries[50]['sha'], array_column($transport->requests, 'url'));
+        self::assertNotContains(self::BASE.'/git/blobs/'.$workflow['sha'], array_column($transport->requests, 'url'));
     }
 
     public function testRegistryConfigUsesOnlyHostsAndInheritsRootEntries(): void

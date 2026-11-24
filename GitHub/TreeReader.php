@@ -12,10 +12,13 @@ use Kanboard\Plugin\Gumshoe\Inventory\NpmLock;
 use Kanboard\Plugin\Gumshoe\Inventory\ParseResult;
 use Kanboard\Plugin\Gumshoe\Inventory\PnpmLock;
 use Kanboard\Plugin\Gumshoe\Inventory\Workflows;
+use Closure;
 use stdClass;
 
 final class TreeReader
 {
+    public const PARSER_VERSION = 2;
+
     private const PARSERS = [
         'composer' => ComposerLock::class,
         'npm' => NpmLock::class,
@@ -52,13 +55,15 @@ final class TreeReader
         #[\SensitiveParameter] ?array $state,
         ?string $jobRef = null,
         ?int $budget = null,
+        #[\SensitiveParameter] array $reusable = [],
+        ?Closure $cachedRegistry = null,
     ): array {
         $state ??= [
             'scan' => [
                 'outcome' => 'partial', 'treeComplete' => false, 'headSha' => null, 'treeSha' => null, 'retryAt' => null,
             ],
             'entries' => null, 'configs' => [], 'registryCache' => [],
-            'index' => 0, 'rows' => 0, 'parsed' => null,
+            'index' => 0, 'rows' => 0, 'parsed' => null, 'parserVersion' => self::PARSER_VERSION,
         ];
         $scan = &$state['scan'];
         $files = [];
@@ -76,8 +81,17 @@ final class TreeReader
                 if (!$this->readMetadata($base, $login, $branch, $state, $jobRef)) {
                     return ['scan' => $scan, 'state' => null, 'files' => $files];
                 }
+                if ($state['entries'] === null && ($repo['outcome'] ?? null) === 'complete'
+                    && $scan['headSha'] === ($repo['head_sha'] ?? null)
+                    && $scan['treeSha'] === ($repo['tree_sha'] ?? null)
+                    && $scan['retryAt'] === null && ($repo['inventoryReusable'] ?? false)) {
+                    $scan['outcome'] = 'complete';
+                    $scan['unchanged'] = true;
+                    return ['scan' => $scan, 'state' => null, 'files' => []];
+                }
             } else {
-                $file = $this->readFile($base, $login, $state, $jobRef);
+                $entry = $state['entries'][$state['index']];
+                $file = $this->readFile($base, $login, $state, $jobRef, $reusable[$entry['path']] ?? null, $cachedRegistry);
                 if ($file !== null) {
                     $files[] = $file;
                 }
@@ -104,6 +118,9 @@ final class TreeReader
     {
         foreach ($files as &$file) {
             $result = $file['result'];
+            if ($result === null) {
+                continue; // The store has a complete parse of this blob.
+            }
             $file['result'] = new ParseResult(
                 array_map(static fn (array $dep): Dependency => new Dependency(...$dep), $result['deps']),
                 $result['status'],
@@ -204,6 +221,11 @@ final class TreeReader
         }
 
         ksort($files, SORT_STRING);
+        if (count($files) > Limits::MAX_REPO_LOCKFILES) {
+            // Keep path order within each group and give lockfiles the available slots first.
+            $lockfiles = array_filter($files, static fn (array $file): bool => $file['kind'] !== 'actions');
+            $files = $lockfiles + $files;
+        }
         $state['scan']['treeComplete'] = $treeComplete && count($files) <= Limits::MAX_REPO_LOCKFILES;
         $state['scan']['outcome'] = $state['scan']['treeComplete'] ? 'complete' : 'partial';
         $state['entries'] = array_slice(array_values($files), 0, Limits::MAX_REPO_LOCKFILES);
@@ -217,6 +239,7 @@ final class TreeReader
                 }
             }
         }
+        $state['scan']['registryPaths'] = array_keys($state['configs']);
     }
 
     private function readFile(
@@ -224,28 +247,38 @@ final class TreeReader
         string $login,
         #[\SensitiveParameter] array &$state,
         ?string $jobRef,
+        ?array $stored,
+        ?Closure $cachedRegistry,
     ): ?array {
         $entry = $state['entries'][$state['index']];
         $kind = $entry['kind'];
         $path = $entry['path'];
         $scan = &$state['scan'];
         $parsed = &$state['parsed'];
+        $parserVersion = $state['parserVersion'] ?? 1;
+        $blob = $entry['blob'];
         $usedRequest = false;
         if ($parsed === null) {
-            if ($state['rows'] === Limits::MAX_REPO_DEPS) {
+            $limits = new Limits($state['rows']);
+            $canReuse = $stored !== null && $stored['blob_sha'] === $blob['sha'] && $stored['kind'] === $kind
+                && (int) $stored['parser_version'] === $parserVersion && self::blobRejection($blob, Limits::MAX_FILE_BYTES) === null;
+            if ($canReuse && $limits->allowsDependencies((int) $stored['dep_count'])) {
+                $parsed = ['status' => 'ok', 'reuse' => true];
+                $state['rows'] += (int) $stored['dep_count'];
+            } elseif ($canReuse || !$limits->allowsDependencies(1)) {
                 $result = new ParseResult([], 'too_many');
             } else {
-                [$body, $status, $scan['retryAt']] = $this->blob($base, $login, $entry['blob'], $jobRef);
+                [$body, $status, $scan['retryAt']] = $this->blob($base, $login, $blob, $jobRef);
                 $usedRequest = true;
                 $parser = self::PARSERS[$kind];
-                $result = $body === null ? new ParseResult([], $status) : $parser::parse($body, new Limits($state['rows']));
+                $result = $body === null ? new ParseResult([], $status) : $parser::parse($body, $limits);
                 $state['rows'] += count($result->deps);
             }
-            $parsed = ['status' => $result->status, 'deps' => array_map(get_object_vars(...), $result->deps)];
+            $parsed ??= ['status' => $result->status, 'deps' => array_map(get_object_vars(...), $result->deps)];
         }
 
-        $file = ['path' => $path, 'blob_sha' => $entry['blob']['sha'], 'kind' => $kind,
-            'parser_version' => 1, 'result' => $parsed];
+        $file = ['path' => $path, 'blob_sha' => $blob['sha'], 'kind' => $kind,
+            'parser_version' => $parserVersion, 'result' => isset($parsed['reuse']) ? null : $parsed];
         if (in_array($kind, ['npm', 'pnpm'], true)) {
             $config = $state['registryKnown'] ? [] : 'unknown';
             if ($state['registryKnown']) {
@@ -254,18 +287,29 @@ final class TreeReader
                         continue;
                     }
                     if (!array_key_exists($candidate, $state['registryCache'])) {
-                        if ($scan['retryAt'] !== null) {
-                            $config = 'unknown';
-                            break;
+                        $registryBlob = $state['configs'][$candidate];
+                        $hosts = $cachedRegistry !== null && self::blobRejection($registryBlob, self::MAX_NPMRC_BYTES) === null
+                            ? $cachedRegistry($candidate, $registryBlob['sha'], $parserVersion) : null;
+                        if ($hosts === null) {
+                            if ($scan['retryAt'] !== null) {
+                                $config = 'unknown';
+                                break;
+                            }
+                            if ($usedRequest) {
+                                return null;
+                            }
+                            [$body, , $scan['retryAt']] = $this->blob(
+                                $base, $login, $registryBlob, $jobRef, self::MAX_NPMRC_BYTES,
+                            );
+                            $hosts = $body === null ? null : self::registryHosts($body);
+                            $usedRequest = true;
+                            if ($hosts !== null) {
+                                $scan['registryFiles'][$candidate] = [
+                                    'sha' => $registryBlob['sha'], 'parserVersion' => $parserVersion, 'hosts' => $hosts,
+                                ];
+                            }
                         }
-                        if ($usedRequest) {
-                            return null;
-                        }
-                        [$body, , $scan['retryAt']] = $this->blob(
-                            $base, $login, $state['configs'][$candidate], $jobRef, self::MAX_NPMRC_BYTES,
-                        );
-                        $state['registryCache'][$candidate] = $body === null ? null : self::registryHosts($body);
-                        $usedRequest = true;
+                        $state['registryCache'][$candidate] = $hosts;
                     }
                     $hosts = $state['registryCache'][$candidate];
                     if ($hosts === null) {
@@ -311,11 +355,8 @@ final class TreeReader
         ?string $jobRef,
         int $maxBytes = Limits::MAX_FILE_BYTES,
     ): array {
-        if ($entry['type'] !== 'blob' || !in_array($entry['mode'], ['100644', '100755'], true)) {
-            return [null, 'unsupported', null];
-        }
-        if (is_int($entry['size']) && $entry['size'] > $maxBytes) {
-            return [null, 'too_large', null];
+        if (($rejection = self::blobRejection($entry, $maxBytes)) !== null) {
+            return [null, $rejection, null];
         }
 
         $request = new Request(
@@ -335,6 +376,15 @@ final class TreeReader
             return [null, 'too_large', $response->retryAt];
         }
         return [$response->body, 'ok', $response->retryAt];
+    }
+
+    private static function blobRejection(array $entry, int $maxBytes): ?string
+    {
+        return match (true) {
+            $entry['type'] !== 'blob' || !in_array($entry['mode'], ['100644', '100755'], true) => 'unsupported',
+            is_int($entry['size']) && $entry['size'] > $maxBytes => 'too_large',
+            default => null,
+        };
     }
 
     private static function registryHosts(#[\SensitiveParameter] string $contents): ?array

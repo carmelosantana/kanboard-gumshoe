@@ -106,6 +106,9 @@ final class ScannerTest extends Base
         $this->vulnerable = false;
         $this->requests = [];
         self::assertSame('done', $this->scanner()->tick(self::INVENTORY, 'cli')['status']);
+        self::assertSame(['gh.list', 'gh.branch'],
+            array_values(array_filter(array_column($this->requests, 'operation'), static fn (string $op): bool =>
+                in_array($op, ['gh.list', 'gh.branch', 'gh.tree', 'gh.blob'], true))));
         self::assertStringContainsString('"version":"0.1.1"', $this->osvRequestBody());
         self::assertSame('affected', $this->repoState());
 
@@ -118,6 +121,58 @@ final class ScannerTest extends Base
         self::assertStringContainsString('"version":"0.1.2"', $this->osvRequestBody());
         self::assertSame('fixed', $this->repoState());
         self::assertSame('fixed', $this->findingStatus());
+    }
+
+    public function testChangedHeadReusesUnchangedBlobsUntilTheParserVersionChanges(): void
+    {
+        $head = self::SHA;
+        $composer = sha1('composer.lock');
+        $pnpm = sha1('pnpm-lock.yaml');
+        $registry = sha1('.npmrc');
+        $responder = function (Request $request) use (&$head, &$composer, $pnpm, &$registry): Response {
+            return match ($request->operation) {
+                'gh.branch' => self::json(['commit' => ['sha' => $head, 'commit' => ['tree' => ['sha' => $head]]]]),
+                'gh.tree' => self::json(['truncated' => false, 'tree' => [
+                    ['path' => 'composer.lock', 'sha' => $composer, 'type' => 'blob', 'mode' => '100644'],
+                    ['path' => 'pnpm-lock.yaml', 'sha' => $pnpm, 'type' => 'blob', 'mode' => '100644'],
+                    ['path' => '.npmrc', 'sha' => $registry, 'type' => 'blob', 'mode' => '100644'],
+                ]]),
+                'gh.blob' => match (basename($request->url)) {
+                    $composer => self::json(['packages' => []]),
+                    $pnpm => new Response(200, [], "lockfileVersion: '9.0'\npackages:\n  is-number@6.0.0: {}\n"),
+                    $registry => new Response(200, [], $registry === sha1('.npmrc')
+                        ? 'registry=https://registry.npmjs.org/' : 'registry=https://example.org/'),
+                },
+                'osv.querybatch' => self::json(['results' => [(object) []]]),
+                default => $this->respond($request),
+            };
+        };
+        $scan = function () use ($responder): array {
+            $this->requests = [];
+            self::assertSame('done', $this->scanner($responder)->tick(self::INVENTORY, 'cli')['status']);
+            self::assertSame('complete', $this->pdo->query('SELECT outcome FROM gumshoe_repos')->fetchColumn());
+            return array_map(static fn (Request $request): string => basename($request->url),
+                array_values(array_filter($this->requests, static fn (Request $request): bool => $request->operation === 'gh.blob')));
+        };
+
+        self::assertSame([$composer, $pnpm, $registry], $scan());
+        $deps = $this->pdo->query('SELECT * FROM gumshoe_deps')->fetchAll(PDO::FETCH_ASSOC);
+        $head = sha1('composer changed');
+        $composer = sha1('new composer.lock');
+        self::assertSame([$composer], $scan());
+        self::assertSame($deps, $this->pdo->query('SELECT * FROM gumshoe_deps')->fetchAll(PDO::FETCH_ASSOC));
+        self::assertStringContainsString('"name":"is-number"', $this->osvRequestBody());
+
+        $head = sha1('registry changed');
+        $registry = sha1('new .npmrc');
+        self::assertSame([$registry], $scan());
+        self::assertSame('private', $this->pdo->query('SELECT egress FROM gumshoe_deps')->fetchColumn());
+        self::assertNotContains('osv.querybatch', array_column($this->requests, 'operation'));
+
+        $old = (int) $this->pdo->query("SELECT parser_version FROM gumshoe_lockfiles WHERE kind = 'pnpm'")->fetchColumn() - 1;
+        $this->pdo->exec("UPDATE gumshoe_lockfiles SET parser_version = $old WHERE kind = 'pnpm'");
+        self::assertSame([$pnpm], $scan());
+        self::assertSame($old + 1, (int) $this->pdo->query("SELECT parser_version FROM gumshoe_lockfiles WHERE kind = 'pnpm'")->fetchColumn());
     }
 
     public function testOsvCommitsEachBatchBeforeFetchingTheNext(): void
@@ -462,7 +517,7 @@ final class ScannerTest extends Base
     {
         return match ($request->operation) {
             'gh.list' => $this->listing(),
-            'gh.branch' => self::json(['commit' => ['sha' => self::SHA, 'commit' => ['tree' => ['sha' => self::SHA]]]]),
+            'gh.branch' => self::json(['commit' => ['sha' => sha1('head-'.$this->version), 'commit' => ['tree' => ['sha' => sha1('tree-'.$this->version)]]]]),
             'gh.tree' => self::json(['truncated' => false, 'tree' => [[
                 'path' => 'package-lock.json', 'type' => 'blob', 'mode' => '100644',
                 'sha' => sha1($this->version), 'size' => 1024,

@@ -110,10 +110,13 @@ final class InventoryStoreTest extends Base
 
     public function testAddingDenyPrefixRefreshesAnUnchangedLockfile(): void
     {
-        $file = $this->file('a', fn (): ParseResult => $this->parsed('4.0.0'));
+        $file = $this->file('a', $this->parsed('4.0.0'));
         $this->apply(1, [$file]);
         self::assertSame(['public'], array_column($this->rows('deps'), 'egress'));
 
+        $file['result'] = static function (): never {
+            throw new RuntimeException('The unchanged blob was re-parsed.');
+        };
         $this->apply(2, [$file], policy: new Policy(['universal-user-']));
         self::assertSame(['denied'], array_column($this->rows('deps'), 'egress'));
         self::assertSame(['new_repo'], array_column($this->rows('dep_changes'), 'kind'));

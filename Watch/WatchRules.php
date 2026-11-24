@@ -21,8 +21,9 @@ final readonly class WatchRules
         $days = intdiv($age, 86400);
 
         return match (true) {
+            ($repo['gone_at'] ?? null) !== null => '',
             !(bool) $owner['enabled'] => 'owner off',
-            $repo['mode'] === 'exclude', ($repo['gone_at'] ?? null) !== null => 'excluded',
+            $repo['mode'] === 'exclude' => 'excluded',
             $repo['mode'] === 'pin' => 'pinned',
             (bool) $repo['fork'] && !(bool) $this->settings['forks'] => 'fork',
             (bool) $repo['archived'] && !(bool) $this->settings['archived'] => 'archived',

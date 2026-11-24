@@ -128,6 +128,39 @@ final class RepoListerTest extends Base
         self::assertSame('auto', $rows[2]['mode']);
     }
 
+    public function testOnlyACompleteListingCanReassignAMissingReposName(): void
+    {
+        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
+        $pdo = $this->container['db']->getConnection();
+        version_1($pdo);
+        $pdo->exec("INSERT INTO gumshoe_owners (login, kind) VALUES ('symfony', 'org')");
+        $repos = new RepoModel($pdo);
+        $owner = ['login' => 'symfony', 'kind' => 'org'];
+        $replacement = $this->repo(2, 'symfony', 'yaml');
+        [$lister] = $this->lister([
+            $this->page([$this->repo(1, 'symfony', 'yaml')]),
+            $this->page([$replacement], self::API.'/organizations/17/repos?type=all&page=2'),
+            new Response(503),
+            $this->page([$replacement]),
+        ]);
+
+        $repos->applyListing(1, $lister->list($owner), 10);
+        $pdo->exec("UPDATE gumshoe_repos SET mode = 'pin' WHERE github_id = 1");
+        $before = $repos->forOwner(1);
+        $repos->applyListing(1, $lister->list($owner), 20);
+        self::assertSame($before, $repos->forOwner(1));
+
+        $repos->applyListing(1, $lister->list($owner), 30);
+        $rows = array_column($repos->forOwner(1), null, 'github_id');
+        self::assertCount(2, $rows);
+        self::assertSame($before[0]['id'], $rows[1]['id']);
+        self::assertSame('pin', $rows[1]['mode']);
+        self::assertSame(30, (int) $rows[1]['gone_at']);
+        self::assertSame('yaml', $rows[2]['name']);
+        self::assertSame('auto', $rows[2]['mode']);
+        self::assertNull($rows[2]['gone_at']);
+    }
+
     private function lister(array $responses): array
     {
         $transport = new FakeTransport($responses);

@@ -3,7 +3,9 @@
 namespace Kanboard\Plugin\Gumshoe\Model;
 
 use Closure;
+use Kanboard\Plugin\Gumshoe\Advisory\AdvisoryCache;
 use Kanboard\Plugin\Gumshoe\Egress\Policy;
+use Kanboard\Plugin\Gumshoe\Inventory\Dependency;
 use Kanboard\Plugin\Gumshoe\Inventory\Differ;
 use Kanboard\Plugin\Gumshoe\Inventory\ParseResult;
 use PDO;
@@ -14,10 +16,33 @@ use Throwable;
 final class InventoryStore
 {
     private readonly Closure $clock;
+    private readonly AdvisoryCache $cache;
 
     public function __construct(private readonly PDO $pdo, ?Closure $clock = null)
     {
         $this->clock = $clock ?? time(...);
+        $this->cache = new AdvisoryCache($pdo);
+    }
+
+    /** Read metadata only. The store loads dependency evidence when applying reused files. */
+    public function filesForReuse(int $repoId): array
+    {
+        $files = $this->execute('SELECT l.*, (SELECT COUNT(*) FROM gumshoe_deps d WHERE d.lockfile_id = l.id) AS dep_count
+            FROM gumshoe_lockfiles l WHERE l.repo_id = ?', [$repoId])->fetchAll(PDO::FETCH_ASSOC);
+        $cached = array_fill_keys($this->execute(
+            "SELECT advisory_id FROM gumshoe_advisory_cache WHERE source = 'inventory-file' AND advisory_id LIKE ?",
+            [$repoId.':%'],
+        )->fetchAll(PDO::FETCH_COLUMN), true);
+        $reusable = array_filter($files, static fn (array $file): bool =>
+            $file['status'] === 'ok' && isset($cached[$repoId.':'.$file['path_hash']]));
+        return ['all' => count($files) === count($reusable), 'files' => array_column($reusable, null, 'path')];
+    }
+
+    public function cachedRegistry(int $repoId, string $path, string $sha, int $parserVersion): ?array
+    {
+        $config = $this->cache->get('inventory-npmrc', $repoId.':'.hash('sha256', $path))['body'] ?? null;
+        return $config !== null && $config['sha'] === $sha && $config['parserVersion'] === $parserVersion
+            ? $config['hosts'] : null;
     }
 
     /**
@@ -28,7 +53,7 @@ final class InventoryStore
      *     treeComplete: bool, headSha: ?string, treeSha: ?string,
      *     files: list<array{
      *         path: string, blob_sha: string, kind: string, parser_version: int,
-     *         result: ParseResult|callable(): ParseResult,
+     *         result: null|ParseResult|callable(): ParseResult,
      *         registryConfig?: array<string, string>|'unknown'
      *     }>
      * } $scan
@@ -51,8 +76,15 @@ final class InventoryStore
                 ->fetchAll(PDO::FETCH_ASSOC);
             // Index by path hash for matching and leave unvisited files in the map.
             $remaining = array_column($remaining, null, 'path_hash');
-            $complete = $scan['treeComplete'];
+            $unchangedHead = $scan['unchanged'] ?? false;
+            $complete = $scan['treeComplete'] || $unchangedHead;
+            $now = ($this->clock)();
             $changes = [];
+            if ($unchangedHead) {
+                foreach ($remaining as $key => $stored) {
+                    $this->reuseDependencies($stored, $repoId.':'.$key, [], $policy, $now);
+                }
+            }
             foreach ($scan['files'] as $file) {
                 $key = hash('sha256', $file['path']);
                 $stored = $remaining[$key] ?? null;
@@ -62,6 +94,14 @@ final class InventoryStore
                 $unchanged = $stored !== null && $stored['status'] === 'ok' && $file['blob_sha'] === $stored['blob_sha']
                     && $file['kind'] === $stored['kind'] && $file['parser_version'] === (int) $stored['parser_version'];
 
+                $cacheId = $repoId.':'.$key;
+                if ($unchanged && !$result instanceof ParseResult
+                    && $this->reuseDependencies($stored, $cacheId, $file, $policy, $now)) {
+                    continue;
+                }
+                if ($result === null) {
+                    throw new RuntimeException('Reused inventory has no complete parse.');
+                }
                 if (!$result instanceof ParseResult) {
                     $result = $result();
                 }
@@ -69,6 +109,12 @@ final class InventoryStore
                 $lockfileId = $unchanged && $ok ? (int) $stored['id'] : $this->saveFile($repoId, $key, $file, $stored, $ok);
                 if ($ok) {
                     array_push($changes, ...$this->replaceDependencies($lockfileId, $file, $result, $policy));
+                    $this->cache->put('inventory-file', $cacheId, [
+                        'registryConfig' => $file['registryConfig'] ?? 'unknown',
+                        'evidence' => array_map(static fn (Dependency $dep): array => [
+                            $dep->registry_evidence, $dep->evidence_inferred,
+                        ], $result->deps),
+                    ], null, $now);
                 } else {
                     $complete = false;
                 }
@@ -77,11 +123,13 @@ final class InventoryStore
             if ($scan['treeComplete']) {
                 foreach ($remaining as $file) {
                     $this->execute('DELETE FROM gumshoe_lockfiles WHERE id = ?', [$file['id']]);
+                    $this->execute("DELETE FROM gumshoe_advisory_cache WHERE source = 'inventory-file' AND advisory_id = ?",
+                        [$repoId.':'.$file['path_hash']]);
                     $changes[] = ['kind' => 'lockfile_gone', 'path' => $file['path']];
                 }
             }
 
-            $now = ($this->clock)();
+            $this->saveRegistryCache($repoId, $scan, $now);
             $firstComplete = $complete && $repo['last_complete_at'] === null;
             if ($firstComplete) {
                 $this->recordChange($runId, $repoId, $now, ['kind' => 'new_repo']);
@@ -105,6 +153,53 @@ final class InventoryStore
                 $this->pdo->rollBack();
             }
             throw $error;
+        }
+    }
+
+    private function reuseDependencies(array $stored, string $cacheId, array $file, Policy $policy, int $now): bool
+    {
+        $parsed = $this->cache->get('inventory-file', $cacheId)['body'] ?? null;
+        if ($parsed === null) {
+            return false;
+        }
+
+        $config = $file['registryConfig'] ?? $parsed['registryConfig'];
+        $rows = $this->execute('SELECT * FROM gumshoe_deps WHERE lockfile_id = ? ORDER BY id', [$stored['id']]);
+        foreach ($rows as $i => $row) {
+            [$evidence, $inferred] = $parsed['evidence'][$i] ?? [null, false];
+            $dep = new Dependency(
+                $row['ecosystem'], $row['name'], $row['version'] === 'unresolved' ? null : $row['version'],
+                $row['scope'], $row['source'], $row['query_type'], $evidence, $inferred,
+            );
+            $egress = $policy->verdict($dep, $stored['kind'], $config);
+            if ($egress !== $row['egress']) {
+                $this->execute('UPDATE gumshoe_deps SET egress = ? WHERE id = ?', [$egress, $row['id']]);
+            }
+        }
+        if ($config !== $parsed['registryConfig']) {
+            $parsed['registryConfig'] = $config;
+            $this->cache->put('inventory-file', $cacheId, $parsed, null, $now);
+        }
+        return true;
+    }
+
+    private function saveRegistryCache(int $repoId, array $scan, int $now): void
+    {
+        foreach ($scan['registryFiles'] ?? [] as $path => $config) {
+            $this->cache->put('inventory-npmrc', $repoId.':'.hash('sha256', $path), $config, null, $now);
+        }
+        if ($scan['treeComplete']) {
+            $keys = array_fill_keys(array_map(static fn (string $path): string => $repoId.':'.hash('sha256', $path),
+                $scan['registryPaths'] ?? []), true);
+            $cached = $this->execute(
+                "SELECT advisory_id FROM gumshoe_advisory_cache WHERE source = 'inventory-npmrc' AND advisory_id LIKE ?",
+                [$repoId.':%'],
+            )->fetchAll(PDO::FETCH_COLUMN);
+            foreach ($cached as $key) {
+                if (!isset($keys[$key])) {
+                    $this->execute("DELETE FROM gumshoe_advisory_cache WHERE source = 'inventory-npmrc' AND advisory_id = ?", [$key]);
+                }
+            }
         }
     }
 

@@ -260,13 +260,19 @@ final class ScanSlice
         $counts = $this->log->counts($this->id());
         $outcome = 'out_of_watch';
         $scan = null;
-        // A complete listing is a token's view. Omission does not prove a
-        // previously visible repository or its lockfiles have been deleted.
-        if ($rules->watched($repo, array_replace($repo, ['gone_at' => null]))) {
+        if ($rules->watched($repo, $repo)) {
             $outcome = 'inaccessible';
-            if ($repo['gone_at'] === null && in_array((int) $repo['owner_id'], $counts['listed_owners'] ?? [], true)) {
+            if (in_array((int) $repo['owner_id'], $counts['listed_owners'] ?? [], true)) {
+                $store = new InventoryStore($this->pdo, $this->clock);
+                $reuse = $store->filesForReuse($id);
+                $files = array_filter($reuse['files'], static fn (array $file): bool =>
+                    (int) $file['parser_version'] === TreeReader::PARSER_VERSION);
+                $repo['inventoryReusable'] = $reuse['all'] && count($files) === count($reuse['files']);
                 $state = $this->log->inventoryState($this->id(), $id);
-                $slice = (new TreeReader($this->client))->readSlice($repo, $repo, $state, $this->run['job'], 1);
+                $slice = (new TreeReader($this->client))->readSlice(
+                    $repo, $repo, $state, $this->run['job'], 1, $files,
+                    fn (string $path, string $sha, int $version): ?array => $store->cachedRegistry($id, $path, $sha, $version),
+                );
                 if ($this->transport->stopped) {
                     return false;
                 }
