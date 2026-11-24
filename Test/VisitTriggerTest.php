@@ -9,6 +9,8 @@ use Kanboard\Plugin\Gumshoe\Run\Scanner;
 use Kanboard\Plugin\Gumshoe\Run\VisitTrigger;
 use Kanboard\Plugin\Gumshoe\Run\WriterLease;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeTransport;
+use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeVaultSecrets;
+use Kanboard\Plugin\Vault\Secrets\SecretValue;
 use KanboardTests\units\Base;
 use PDO;
 
@@ -17,6 +19,7 @@ use function Kanboard\Plugin\Gumshoe\Schema\version_1;
 require_once 'tests/units/Base.php';
 require_once __DIR__.'/ReleasesConnection.php';
 require_once __DIR__.'/Fakes/FakeTransport.php';
+require_once __DIR__.'/Fakes/FakeVaultSecrets.php';
 
 final class VisitTriggerTest extends Base
 {
@@ -34,6 +37,8 @@ final class VisitTriggerTest extends Base
         require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
         $this->pdo = $this->container['db']->getConnection();
         version_1($this->pdo);
+        $this->pdo->exec("INSERT INTO gumshoe_owners (login, kind, token_ref) VALUES ('symfony', 'org', 'vault://17/token')");
+        $this->container['vaultSecrets'] = new FakeVaultSecrets(static fn () => SecretValue::of(bin2hex(random_bytes(20))));
         $this->log = new RunLog($this->pdo);
         $inventory = $this->log->start('gumshoe.inventory', 'cli', 'done', $this->now);
         $this->log->finish((int) $inventory['id'], 'ok', $this->now);

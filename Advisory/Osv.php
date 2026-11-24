@@ -26,30 +26,6 @@ final class Osv
         $this->clock = $clock ?? time(...);
     }
 
-    /** Process due public rows. Returns the next retry time, or null when no public rows remain pending. */
-    public function queryPending(int $runId): ?int
-    {
-        $cached = $this->cachedVersions();
-        while (($rows = $this->dueRows($runId)) !== []) {
-            $batch = $this->fetch($rows, $cached);
-            $this->pdo->beginTransaction();
-            try {
-                $this->store($batch);
-                $this->pdo->commit();
-            } catch (\Throwable $failure) {
-                $this->pdo->rollBack();
-                throw $failure;
-            }
-            if ($batch['retryAt'] !== null) {
-                return $batch['retryAt'];
-            }
-            foreach ($batch['records'] as $id => $record) {
-                $cached[$id] = $record['modified'];
-            }
-        }
-        return $this->pendingRetryAt($runId);
-    }
-
     public function dueRows(int $runId): array
     {
         $pending = $this->pdo->prepare(

@@ -7,6 +7,8 @@ use Kanboard\Plugin\Gumshoe\Plugin;
 use Kanboard\Plugin\Gumshoe\Run\RunLog;
 use Kanboard\Plugin\Gumshoe\Run\Scanner;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeTransport;
+use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeVaultSecrets;
+use Kanboard\Plugin\Vault\Secrets\SecretValue;
 use KanboardTests\units\Base;
 
 use function Kanboard\Plugin\Gumshoe\Schema\version_1;
@@ -14,6 +16,7 @@ use function Kanboard\Plugin\Gumshoe\Schema\version_1;
 require_once 'tests/units/Base.php';
 require_once __DIR__.'/ReleasesConnection.php';
 require_once __DIR__.'/Fakes/FakeTransport.php';
+require_once __DIR__.'/Fakes/FakeVaultSecrets.php';
 
 final class ForemanHookTest extends Base
 {
@@ -24,6 +27,8 @@ final class ForemanHookTest extends Base
         require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
         $pdo = $this->container['db']->getConnection();
         version_1($pdo);
+        $pdo->exec("INSERT INTO gumshoe_owners (login, kind, token_ref) VALUES ('symfony', 'org', 'vault://17/token')");
+        $this->container['vaultSecrets'] = new FakeVaultSecrets(static fn () => SecretValue::of(bin2hex(random_bytes(20))));
         $now = 1_800_000_000;
         $transport = new FakeTransport([new Response(503, ['Retry-After' => '1'])]);
         $this->container['gumshoeScanner'] = new Scanner($this->container, $transport, 'https://example.com/', static function () use (&$now): int {
@@ -38,7 +43,6 @@ final class ForemanHookTest extends Base
         self::assertSame([10, 10], array_column($jobs, 'budget'));
 
         $log = new RunLog($pdo);
-        $pdo->exec("INSERT INTO gumshoe_owners (login, kind, enabled) VALUES ('symfony', 'org', 0)");
         $run = $log->start('gumshoe.inventory', 'foreman', 'query', $now);
         $log->checkpoint((int) $run['id'], 'query', null, null, 'HttpFailure');
         $this->assertResult('more', $jobs[0]['run']($now));

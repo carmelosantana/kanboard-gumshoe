@@ -19,11 +19,6 @@ final class Kev
     {
     }
 
-    public function refresh(): void
-    {
-        $this->store($this->fetch(), time());
-    }
-
     public function fetch(): array
     {
         foreach ([self::OFFICIAL, self::MIRROR] as $url) {

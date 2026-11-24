@@ -46,12 +46,12 @@ final readonly class RunLog
 
     public function inventoryState(int $run, int $repo): ?array
     {
-        return $this->inventoryPayloads($run.':'.$repo.':state:')[0] ?? null;
+        return $this->payloads('run-inventory', $run.':'.$repo.':state:')[0] ?? null;
     }
 
     public function inventoryFiles(int $run, int $repo): array
     {
-        return $this->inventoryPayloads($run.':'.$repo.':file:');
+        return $this->payloads('run-inventory', $run.':'.$repo.':file:');
     }
 
     public function checkpointInventory(int $run, int $repo, array $state, array $files, int $now): void
@@ -59,10 +59,10 @@ final readonly class RunLog
         $prefix = $run.':'.$repo.':';
         $this->execute("DELETE FROM gumshoe_advisory_cache WHERE source = 'run-inventory' AND advisory_id LIKE ?",
             [$prefix.'state:%']);
-        $this->saveInventoryPayload($prefix.'state:', $state, $now);
+        $this->savePayload('run-inventory', $prefix.'state:', $state, $now);
         $index = $state['index'] - count($files);
         foreach ($files as $file) {
-            $this->saveInventoryPayload($prefix.sprintf('file:%03d:', $index++), $file, $now);
+            $this->savePayload('run-inventory', $prefix.sprintf('file:%03d:', $index++), $file, $now);
         }
     }
 
@@ -72,19 +72,51 @@ final readonly class RunLog
         $this->execute("DELETE FROM gumshoe_advisory_cache WHERE source = 'run-inventory' AND advisory_id LIKE ?", [$prefix.'%']);
     }
 
-    private function saveInventoryPayload(string $prefix, array $payload, int $now): void
+    public function malwareState(int $run): ?array
     {
-        // A parsed file can exceed MariaDB's per-value or packet limits.
+        return (new AdvisoryCache($this->pdo))->get('run-malware', (string) $run)['body'] ?? null;
+    }
+
+    public function checkpointMalware(int $run, array $state, array $page, int $now): void
+    {
+        $prefix = $run.':';
+        if (isset($state['catalog'])) {
+            // Carry forward pages staged by the earlier aggregate format.
+            $this->savePayload('run-malware', $prefix.'000000000:', $state['catalog'], $now);
+            unset($state['catalog']);
+        }
+        $state['seen'][$page['key']] = true;
+        $state['done'] = $page['next'] === null;
+        $this->savePayload('run-malware', $prefix.sprintf('%09d:', count($state['seen'])), $page['items'], $now);
+        (new AdvisoryCache($this->pdo))->put('run-malware', (string) $run, $state, null, $now);
+    }
+
+    public function malwarePages(int $run): array
+    {
+        $state = $this->malwareState($run) ?? [];
+        $legacy = $state['catalog'] ?? (array_is_list($state) ? $state : []);
+        return [$legacy, ...$this->payloads('run-malware', $run.':')];
+    }
+
+    public function clearMalware(int $run): void
+    {
+        $this->execute("DELETE FROM gumshoe_advisory_cache WHERE source = 'run-malware' AND (advisory_id = ? OR advisory_id LIKE ?)",
+            [(string) $run, $run.':%']);
+    }
+
+    private function savePayload(string $source, string $prefix, array $payload, int $now): void
+    {
+        // A payload can exceed MariaDB's per-value or packet limits.
         $cache = new AdvisoryCache($this->pdo);
         foreach (str_split(json_encode($payload, JSON_THROW_ON_ERROR), 512 * 1024) as $index => $chunk) {
-            $cache->put('run-inventory', $prefix.sprintf('%06d', $index), ['chunk' => $chunk], null, $now);
+            $cache->put($source, $prefix.sprintf('%06d', $index), ['chunk' => $chunk], null, $now);
         }
     }
 
-    private function inventoryPayloads(string $prefix): array
+    private function payloads(string $source, string $prefix): array
     {
         $rows = $this->execute("SELECT advisory_id, body FROM gumshoe_advisory_cache
-            WHERE source = 'run-inventory' AND advisory_id LIKE ? ORDER BY advisory_id", [$prefix.'%']);
+            WHERE source = ? AND advisory_id LIKE ? ORDER BY advisory_id", [$source, $prefix.'%']);
         $payloads = [];
         while ($row = $rows->fetch(PDO::FETCH_ASSOC)) {
             $key = substr($row['advisory_id'], 0, -6);

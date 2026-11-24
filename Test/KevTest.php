@@ -39,11 +39,11 @@ final class KevTest extends Base
         ]);
         $client = new Client($transport, 'https://kanboard.example');
         $kev = new Kev($client, new AdvisoryCache($pdo));
-        $kev->refresh();
+        $kev->store($kev->fetch(), 1000);
         self::assertTrue($kev->contains($firstCve));
         $this->expectException(HttpFailure::class);
         try {
-            $kev->refresh();
+            $kev->store($kev->fetch(), 1100);
         } finally {
             self::assertSame([self::OFFICIAL, self::MIRROR, self::OFFICIAL, self::MIRROR], array_column($transport->requests, 'url'));
             self::assertTrue((new Kev($client, new AdvisoryCache($pdo)))->contains($firstCve));

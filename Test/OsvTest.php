@@ -49,7 +49,7 @@ final class OsvTest extends Base
             self::json(self::vuln(self::SECOND, self::NEW)),
         ]);
 
-        $this->osv($pdo, $transport)->queryPending(7);
+        $this->drain($this->osv($pdo, $transport));
         self::assertSame([
             '{"queries":[{"package":{"ecosystem":"npm","name":"lodash"},"version":"4.17.20"},{"package":{"ecosystem":"Packagist","name":"symfony/yaml"},"version":"v4.0.0"},{"commit":"'.self::SHA.'"}]}',
             '{"queries":[{"package":{"ecosystem":"npm","name":"lodash"},"version":"4.17.20","page_token":"P:page-two:"}]}',
@@ -78,7 +78,7 @@ final class OsvTest extends Base
         }
         $transport = new FakeTransport(array_map(static fn (int $size): Response =>
             self::json(['results' => array_fill(0, $size, (object) [])]), [1000, 1000, 500]));
-        $this->osv($pdo, $transport)->queryPending(7);
+        $this->drain($this->osv($pdo, $transport));
         self::assertSame(array_map(static fn (array $batch): string =>
             json_encode(['queries' => $batch], JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR), array_chunk($queries, 1000)),
             array_column($transport->requests, 'body'));
@@ -95,13 +95,13 @@ final class OsvTest extends Base
             self::json(['results' => [(object) [], (object) []]]),
         ]);
         $osv = $this->osv($pdo, $transport);
-        self::assertSame(1180, $osv->queryPending(7));
+        self::assertSame(1180, $this->drain($osv));
         self::assertSame(['pending', 'pending'], $pdo->query('SELECT state FROM gumshoe_pending ORDER BY id')->fetchAll(PDO::FETCH_COLUMN));
         self::assertSame([1180, 1180], array_map(intval(...), $pdo->query('SELECT retry_at FROM gumshoe_pending ORDER BY id')->fetchAll(PDO::FETCH_COLUMN)));
         self::assertSame([], $osv->results(7));
-        self::assertSame(1180, $osv->queryPending(7));
+        self::assertSame(1180, $this->drain($osv));
         self::assertCount(1, $transport->requests);
-        self::assertNull($this->osv($pdo, $transport, 1180)->queryPending(7));
+        self::assertNull($this->drain($this->osv($pdo, $transport, 1180)));
         self::assertSame([1 => [], 2 => []], $osv->results(7));
     }
 
@@ -112,7 +112,7 @@ final class OsvTest extends Base
         $this->add($pdo, 'npm', 'lodash', '4.17.20');
         $this->add($pdo, 'composer', 'symfony/yaml', 'v4.0.0');
         $osv = $this->osv($pdo, new FakeTransport($responses));
-        self::assertSame(1060, $osv->queryPending(7));
+        self::assertSame(1060, $this->drain($osv));
         self::assertSame([], $osv->results(7));
     }
 
@@ -126,6 +126,15 @@ final class OsvTest extends Base
         yield 'record fetch fails' => [[
             self::json(['results' => [['vulns' => [self::vuln(self::FIRST, self::NEW)]], (object) []]]), new Response(503),
         ]];
+    }
+
+    private function drain(Osv $osv): ?int
+    {
+        while (($rows = $osv->dueRows(7)) !== []) {
+            $batch = $osv->fetch($rows, $osv->cachedVersions());
+            $osv->store($batch);
+        }
+        return $osv->pendingRetryAt(7);
     }
 
     private function database(): array

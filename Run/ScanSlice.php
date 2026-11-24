@@ -19,7 +19,6 @@ use Kanboard\Plugin\Gumshoe\Http\HttpFailure;
 use Kanboard\Plugin\Gumshoe\Http\Transport;
 use Kanboard\Plugin\Gumshoe\Model\FindingModel;
 use Kanboard\Plugin\Gumshoe\Model\InventoryStore;
-use Kanboard\Plugin\Gumshoe\Model\OwnerModel;
 use Kanboard\Plugin\Gumshoe\Model\RepoModel;
 use Kanboard\Plugin\Gumshoe\Secrets\VaultTokenSource;
 use Kanboard\Plugin\Gumshoe\Watch\WatchRules;
@@ -60,6 +59,7 @@ final class ScanSlice
         private readonly Closure $clock,
         private readonly ?int $deadline,
         private readonly array $settings,
+        private readonly Closure $sleeper,
     ) {
         $this->lease = new WriterLease($pdo, $clock);
         $this->log = new RunLog($pdo);
@@ -77,10 +77,20 @@ final class ScanSlice
     public function run(string $job, string $trigger): array
     {
         $more = ['status' => 'more', 'summary' => 'The scan will continue on the next slice.'];
+        $busy = ['status' => 'more', 'summary' => 'Another writer holds the scan lease.'];
         $claimed = false;
+        $waitUntil = null;
         try {
+            if (!$this->tokens->available() || $this->execute(
+                "SELECT 1 FROM gumshoe_owners WHERE watch_id = 1 AND enabled = 1 AND token_ref <> '' LIMIT 1",
+            )->fetchColumn() === false) {
+                return ['status' => 'done', 'summary' => 'Scanning needs Vault Server sharing and an enabled owner with a token reference.'];
+            }
+            if ($this->deadline !== null && ($this->clock)() >= $this->deadline) {
+                return $more;
+            }
             if (!($claimed = $this->lease->claim($this->holder, self::TTL))) {
-                return ['status' => 'done', 'summary' => 'Another writer holds the scan lease.'];
+                return $busy;
             }
             $active = $this->log->active();
             if ($active !== null && $active['job'] !== $job
@@ -88,8 +98,14 @@ final class ScanSlice
                 return $more;
             }
             $latest = $this->log->latest($job);
-            if ((int) ($latest['retry_at'] ?? 0) > ($this->clock)()) {
-                return ['status' => 'done', 'summary' => 'The scan is waiting for its retry time.'];
+            $retryAt = (int) ($latest['retry_at'] ?? 0);
+            if ($retryAt > ($this->clock)()) {
+                $summary = 'waiting for retry at '.date('H:i', $retryAt);
+                if ($latest['status'] === 'more') {
+                    $waitUntil = $retryAt;
+                    return ['status' => 'more', 'summary' => $summary];
+                }
+                return ['status' => 'done', 'summary' => $summary];
             }
             if (($latest['status'] ?? null) === 'more') {
                 $this->run = $latest;
@@ -98,7 +114,7 @@ final class ScanSlice
                     $run = $this->log->start($job, $trigger, $job === Jobs::INVENTORY ? 'discover' : 'query', ($this->clock)());
                     if ($job === Jobs::RECHECK) {
                         $id = (int) $run['id'];
-                        $this->enqueue($id);
+                        $this->enqueue($id, includeActions: false);
                         $this->log->checkpoint($id, 'query', $this->pendingPosition($id));
                         return $this->log->latest($job);
                     }
@@ -136,7 +152,7 @@ final class ScanSlice
             return $more;
         } catch (Throwable $failure) {
             if (!$claimed && $failure instanceof PDOException && self::claimContended($failure)) {
-                return ['status' => 'done', 'summary' => 'Another writer holds the scan lease.'];
+                return $busy;
             }
             if (!isset($this->run)) {
                 return ['status' => 'failed', 'summary' => 'The scan could not start.'];
@@ -163,6 +179,13 @@ final class ScanSlice
             $this->tokens->endSlice();
             if ($claimed) {
                 $this->lease->release($this->holder);
+            }
+            if ($waitUntil !== null && $trigger === 'cli') {
+                $now = ($this->clock)();
+                $seconds = min(5, $waitUntil - $now, ($this->deadline ?? $waitUntil) - $now);
+                if ($seconds > 0) {
+                    ($this->sleeper)($seconds);
+                }
             }
         }
     }
@@ -201,8 +224,6 @@ final class ScanSlice
 
     private function discover(): bool
     {
-        // On a fresh install OwnerModel seeds the configured watch under the fence.
-        $this->write(fn () => new OwnerModel($this->pdo));
         $owner = $this->execute('SELECT * FROM gumshoe_owners WHERE watch_id = 1 AND enabled = 1 AND id >= ? ORDER BY id LIMIT 1',
             [$this->position() ?? 1])->fetch(PDO::FETCH_ASSOC);
         if ($owner === false) {
@@ -216,12 +237,13 @@ final class ScanSlice
             return false;
         }
 
-        $tokenRetry = $this->tokens->status($owner['login'])['retryAt'];
-        $retryAt = $listing['retryAt'] ?? $tokenRetry;
-        return $this->write(function () use ($owner, $listing, $id, $retryAt): bool {
+        $token = $this->tokens->status($owner['login']);
+        $retryAt = $listing['retryAt'] ?? $token['retryAt'];
+        $canRetry = $retryAt !== null || ($token['status'] !== 'missing' && !str_starts_with($token['status'], 'refused:'));
+        return $this->write(function () use ($owner, $listing, $id, $retryAt, $canRetry): bool {
             $this->saveTokenStatus($owner);
             if ($listing['status'] !== 'complete') {
-                if ($this->run['exception_class'] === null) {
+                if ($canRetry && $this->run['exception_class'] === null) {
                     return $this->backoff(HttpFailure::class, $retryAt);
                 }
                 $counts = $this->log->counts($this->id());
@@ -317,7 +339,7 @@ final class ScanSlice
     private function query(): bool
     {
         if (!$this->pendingFiltered) {
-            if ($this->denyPrefixes !== []) {
+            if ($this->denyPrefixes !== [] || $this->run['job'] === Jobs::RECHECK) {
                 $this->write($this->filterPending(...));
             }
             $this->pendingFiltered = true;
@@ -358,9 +380,9 @@ final class ScanSlice
             return $this->write(fn () => $this->advance('match'));
         }
 
-        $saved = $this->cache->get('run-malware', (string) $this->id())['body'] ?? null;
+        $saved = $this->log->malwareState($this->id());
         if ($saved === null || (isset($saved['seen']) && !$saved['done'])) {
-            return $this->queryMalware($saved ?? ['catalog' => [], 'seen' => []]);
+            return $this->queryMalware($saved ?? ['seen' => []]);
         }
 
         $kev = new Kev($this->client, $this->cache);
@@ -386,13 +408,12 @@ final class ScanSlice
         }
 
         return $this->write(function () use ($github, $page, $saved): bool {
-            array_push($saved['catalog'], ...$page['items']);
-            $saved['seen'][$page['key']] = true;
-            $saved['done'] = $page['next'] === null;
             $now = ($this->clock)();
-            $this->cache->put('run-malware', (string) $this->id(), $saved, null, $now);
-            if ($saved['done']) {
-                $github->store($saved['catalog'], $this->cache, $now);
+            $this->log->checkpointMalware($this->id(), $saved, $page, $now);
+            if ($page['next'] === null) {
+                foreach ($this->log->malwarePages($this->id()) as $items) {
+                    $github->store($items, $this->cache, $now);
+                }
             }
             return $this->advance('query', $page['next']);
         });
@@ -417,10 +438,7 @@ final class ScanSlice
             [$runId, $id],
         );
         $this->osvResults ??= (new Osv($this->client, $this->pdo, $this->clock))->results($runId);
-        if ($this->malwareCatalog === null) {
-            $saved = $inventory ? ($this->cache->get('run-malware', (string) $runId)['body'] ?? []) : [];
-            $this->malwareCatalog = $saved['catalog'] ?? $saved;
-        }
+        $this->malwareCatalog ??= $inventory ? array_merge(...$this->log->malwarePages($runId)) : [];
         $catalog = $this->malwareCatalog;
         $github = new GithubMalware($this->client);
         $matches = [];
@@ -558,9 +576,10 @@ final class ScanSlice
         return ceil(min(10, $base) * 10 - 1e-10) / 10;
     }
 
-    private function enqueue(int $runId): void
+    private function enqueue(int $runId, bool $includeActions = true): void
     {
-        $triples = $this->rows("SELECT DISTINCT query_type, ecosystem, name, version FROM gumshoe_deps WHERE egress = 'public'");
+        $triples = $this->rows("SELECT DISTINCT query_type, ecosystem, name, version FROM gumshoe_deps WHERE egress = 'public'"
+            .($includeActions ? '' : " AND ecosystem <> 'actions'"));
         $insert = $this->pdo->prepare(
             "INSERT INTO gumshoe_pending (run_id, query_type, ecosystem, name, version, egress) VALUES (?, ?, ?, ?, ?, 'public')"
         );
@@ -573,6 +592,13 @@ final class ScanSlice
 
     private function filterPending(): void
     {
+        if ($this->run['job'] === Jobs::RECHECK) {
+            $this->execute("UPDATE gumshoe_pending SET egress = 'unqueryable'
+                WHERE run_id = ? AND egress = 'public' AND ecosystem = 'actions'", [$this->id()]);
+        }
+        if ($this->denyPrefixes === []) {
+            return;
+        }
         foreach ($this->rows("SELECT id, name FROM gumshoe_pending WHERE run_id = ? AND egress = 'public'", [$this->id()]) as $row) {
             if ($this->denied($row['name'])) {
                 $this->execute("UPDATE gumshoe_pending SET egress = 'denied' WHERE id = ?", [$row['id']]);
@@ -664,8 +690,9 @@ final class ScanSlice
 
     private function finish(string $status, ?string $error = null, ?int $retryAt = null): void
     {
-        $this->execute("DELETE FROM gumshoe_advisory_cache WHERE (source = 'run-malware' AND advisory_id = ?)
-            OR (source = 'run-transition' AND advisory_id LIKE ?)", [(string) $this->id(), $this->id().':%']);
+        $this->execute("DELETE FROM gumshoe_advisory_cache WHERE source = 'run-transition' AND advisory_id LIKE ?",
+            [$this->id().':%']);
+        $this->log->clearMalware($this->id());
         $this->log->clearInventory($this->id());
         $this->log->finish($this->id(), $status, ($this->clock)(), $error, $retryAt);
     }

@@ -8,6 +8,7 @@ use Kanboard\Plugin\Gumshoe\Http\Transport;
 use Kanboard\Plugin\Gumshoe\Run\Jobs;
 use Kanboard\Plugin\Gumshoe\Run\RunLog;
 use Kanboard\Plugin\Gumshoe\Run\Scanner;
+use Kanboard\Plugin\Gumshoe\Run\WriterLease;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeVaultSecrets;
 use Kanboard\Plugin\Vault\Secrets\SecretValue;
 use KanboardTests\units\Base;
@@ -212,11 +213,15 @@ final class ScannerTest extends Base
     {
         $first = 'https://api.github.com/advisories?type=malware&ecosystem=npm&per_page=100';
         $second = $first.'&after=Y3Vyc29y%3D';
-        $catalog = file_get_contents(__DIR__.'/fixtures/ghsa/malware-npm.json');
+        $catalog = json_decode(file_get_contents(__DIR__.'/fixtures/ghsa/malware-npm.json'), true, flags: JSON_THROW_ON_ERROR);
         $file = function (Request $request) use ($first, $second, $catalog): Response {
             if ($request->url === $first) {
                 $this->now++;
-                return new Response(200, ['Link' => "<$second>; rel=next"], $catalog);
+                return new Response(200, ['Link' => "<$second>; rel=next"], json_encode(array_slice($catalog, 0, 2)));
+            }
+            if ($request->url === $second) {
+                $this->now++;
+                return self::json(array_slice($catalog, 2));
             }
             return $this->respond($request);
         };
@@ -224,12 +229,22 @@ final class ScannerTest extends Base
         self::assertSame('query', $this->latest()['phase']);
         self::assertSame($second, $this->latest()['position']);
 
+        $chunks = fn (): array => $this->pdo->query("SELECT advisory_id, body FROM gumshoe_advisory_cache
+            WHERE source = 'run-malware' AND advisory_id LIKE '%:%' ORDER BY advisory_id")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $firstPage = $chunks();
+        self::assertCount(1, $firstPage);
         $this->requests = [];
+        self::assertSame('more', $this->scanner($file)->tick(self::INVENTORY, 'foreman', $this->now + 1)['status']);
+        self::assertSame([$second], array_column($this->requests, 'url'));
+        self::assertCount(2, $chunks());
+        self::assertSame($firstPage, array_intersect_key($chunks(), $firstPage));
+
         self::assertSame('done', $this->scanner()->tick(self::INVENTORY, 'foreman')['status']);
-        self::assertSame($second, $this->requests[0]->url);
         self::assertNotContains($first, array_column($this->requests, 'url'));
-        self::assertSame(count(json_decode($catalog, true)), (int) $this->pdo
+        self::assertSame(count($catalog), (int) $this->pdo
             ->query("SELECT COUNT(*) FROM gumshoe_advisory_cache WHERE source = 'github-malware'")->fetchColumn());
+        self::assertSame(0, (int) $this->pdo
+            ->query("SELECT COUNT(*) FROM gumshoe_advisory_cache WHERE source = 'run-malware'")->fetchColumn());
     }
 
     public function testInventoryResumesARepositoryWithOneRequestPerSlice(): void
@@ -343,10 +358,14 @@ final class ScannerTest extends Base
 
         self::assertSame('done', $jobs[0]['run']($this->now + 10)['status']);
         $this->pdo->exec('UPDATE gumshoe_settings SET hourly = 1');
+        $this->pdo->prepare("INSERT INTO gumshoe_deps (lockfile_id, ecosystem, name, version, scope, query_type, egress)
+            SELECT id, 'actions', 'actions/checkout', ?, 'action', 'commit', 'public' FROM gumshoe_lockfiles")
+            ->execute([self::SHA]);
         $this->requests = [];
         self::assertSame('done', $jobs[1]['run']($this->now + 10)['status']);
         self::assertSame(['osv.querybatch'], array_column($this->requests, 'operation'));
-        self::assertStringContainsString('"version":"0.1.1"', $this->osvRequestBody());
+        self::assertSame(['queries' => [['package' => ['ecosystem' => 'npm', 'name' => 'flatmap-stream'], 'version' => '0.1.1']]],
+            json_decode($this->osvRequestBody(), true));
     }
 
     public function testQueryAndSyncPublishTheirCurrentPositionsBeforeWork(): void
@@ -410,7 +429,7 @@ final class ScannerTest extends Base
         $run = $this->latest();
         self::assertGreaterThanOrEqual($this->now + 60, (int) $run['retry_at']);
         $count = count($this->requests);
-        self::assertSame('done', $scanner->tick(self::INVENTORY, 'foreman')['status']);
+        self::assertSame('more', $scanner->tick(self::INVENTORY, 'foreman')['status']);
         self::assertCount($count, $this->requests);
         $this->now = (int) $run['retry_at'];
         $result = $scanner->tick(self::INVENTORY, 'foreman');
@@ -429,15 +448,90 @@ final class ScannerTest extends Base
         }
     }
 
-    public function testVaultRefusalDoesNotMakeAnUnauthenticatedListing(): void
+    public function testForemanRetryWaitUsesTheTriggerAndLeavesTheWriterFree(): void
     {
-        $this->container['vaultSecrets']->ready = false;
-        $scanner = $this->scanner();
-        self::assertSame('more', $scanner->tick(self::INVENTORY, 'cli')['status']);
-        $this->now = (int) $this->latest()['retry_at'];
-        self::assertSame('failed', $scanner->tick(self::INVENTORY, 'cli')['status']);
+        $log = new RunLog($this->pdo);
+        $id = (int) $log->start(self::INVENTORY, 'foreman', 'discover', $this->now)['id'];
+        $retryAt = $this->now + 60;
+        $log->defer($id, $retryAt);
+        $sleeps = [];
+        $lease = new WriterLease($this->pdo, fn (): int => $this->now);
+        $scanner = $this->scanner(sleeper: static function (int $seconds) use (&$sleeps, $lease): void {
+            self::assertTrue($lease->claim('waiting-test', 60));
+            self::assertTrue($lease->release('waiting-test'));
+            $sleeps[] = $seconds;
+        });
+        $job = (new Jobs($scanner))->descriptors()[0]['run'];
+        $waiting = ['status' => 'more', 'summary' => 'waiting for retry at '.date('H:i', $retryAt)];
+        self::assertSame($waiting, $job($this->now + 10, 'web'));
+        self::assertSame([], $sleeps);
+        self::assertSame($waiting, $job($this->now + 10, 'cli'));
+        self::assertSame($waiting, $job($this->now + 2, 'cli'));
+        $log->defer($id, $this->now + 1);
+        self::assertSame('more', $job($this->now + 10, 'cli')['status']);
+        self::assertSame([5, 2, 1], $sleeps);
         self::assertSame([], $this->requests);
-        self::assertSame('refused', $this->pdo->query('SELECT token_status FROM gumshoe_owners')->fetchColumn());
+
+        $log->finish($id, 'failed', $this->now, retryAt: $retryAt);
+        self::assertSame('done', $job($this->now + 10, 'cli')['status']);
+        self::assertSame([5, 2, 1], $sleeps);
+        self::assertCount(1, $log->recent());
+    }
+
+    public function testBothJobsReturnMoreWhileAnotherWriterHoldsTheLease(): void
+    {
+        $lease = new WriterLease($this->pdo, fn (): int => $this->now);
+        self::assertTrue($lease->claim('other-writer', 60));
+        $scanner = $this->scanner();
+        foreach ([self::INVENTORY, self::RECHECK] as $job) {
+            self::assertSame('more', $scanner->tick($job, 'web')['status']);
+        }
+        self::assertSame([], $this->requests);
+        self::assertSame([], (new RunLog($this->pdo))->recent());
+        self::assertTrue($lease->release('other-writer'));
+    }
+
+    /** @dataProvider vaultPrerequisites */
+    public function testJobsDoNoWorkWithoutVaultAndAnEnabledOwnerWithARef(string $missing): void
+    {
+        match ($missing) {
+            'api' => $this->removeVault(),
+            'sharing' => $this->container['vaultSecrets']->ready = false,
+            'ref' => $this->pdo->exec("UPDATE gumshoe_owners SET token_ref = NULL"),
+            'enabled' => $this->pdo->exec("UPDATE gumshoe_owners SET enabled = 0"),
+        };
+        $scanner = $this->scanner();
+        foreach ([self::INVENTORY, self::RECHECK] as $job) {
+            self::assertSame('done', $scanner->tick($job, 'foreman')['status']);
+        }
+        self::assertSame([], $this->requests);
+        self::assertSame([], (new RunLog($this->pdo))->recent());
+    }
+
+    public static function vaultPrerequisites(): iterable
+    {
+        foreach (['api', 'sharing', 'ref', 'enabled'] as $missing) {
+            yield $missing => [$missing];
+        }
+    }
+
+    private function removeVault(): void
+    {
+        unset($this->container['vaultSecrets']);
+    }
+
+    public function testVaultRefusalForEveryOwnerFailsWithoutAnUnauthenticatedListing(): void
+    {
+        $vault = $this->container['vaultSecrets'];
+        $vault->refusal = 'not_shared';
+        $this->pdo->exec("INSERT INTO gumshoe_owners (login, kind) VALUES ('php', 'org')");
+        $scanner = $this->scanner();
+        self::assertSame('failed', $scanner->tick(self::INVENTORY, 'foreman')['status']);
+        self::assertSame('failed', $this->latest()['status']);
+        self::assertSame([], $this->requests);
+        self::assertCount(1, $vault->reads);
+        self::assertSame(['refused', 'missing'], $this->pdo->query(
+            'SELECT token_status FROM gumshoe_owners ORDER BY id')->fetchAll(PDO::FETCH_COLUMN));
     }
 
     public function testInaccessibleAndOutOfWatchRepositoriesArePreservedAndOldLogsPurged(): void
@@ -486,7 +580,7 @@ final class ScannerTest extends Base
         self::fail('No OSV query recorded.');
     }
 
-    private function scanner(?\Closure $responder = null, ?\Closure $clock = null): Scanner
+    private function scanner(?\Closure $responder = null, ?\Closure $clock = null, ?\Closure $sleeper = null): Scanner
     {
         $send = function (Request $request) use ($responder): Response {
             self::assertFalse($this->pdo->inTransaction(), 'Outbound '.$request->operation.' opened inside a transaction.');
@@ -501,7 +595,8 @@ final class ScannerTest extends Base
                 return ($this->send)($request);
             }
         };
-        return new Scanner($this->container, $transport, 'https://kanboard.example', $clock ?? fn (): int => $this->now);
+        return new Scanner($this->container, $transport, 'https://kanboard.example', $clock ?? fn (): int => $this->now,
+            $sleeper ?? static fn (int $seconds): null => null);
     }
 
     private function listing(): Response

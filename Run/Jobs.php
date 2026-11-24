@@ -22,7 +22,7 @@ final readonly class Jobs
                 'plugin' => 'Gumshoe',
                 'interval' => $interval,
                 'budget' => self::BUDGET,
-                'run' => fn (int $deadline): array => $this->scanner->tick($id, 'foreman', $deadline),
+                'run' => fn (int $deadline, string $trigger = 'foreman'): array => $this->scanner->tick($id, $trigger, $deadline),
             ];
         }
         return $jobs;

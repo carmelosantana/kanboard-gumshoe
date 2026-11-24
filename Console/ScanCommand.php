@@ -53,7 +53,10 @@ final class ScanCommand extends BaseCommand
             }
 
             $active = $log->active();
-            if ($active !== null && $active['job'] !== $job) {
+            if ($active === null) {
+                return self::SUCCESS;
+            }
+            if ($active['job'] !== $job) {
                 $output->writeln('<error>Resume the other Gumshoe job before running this job.</error>');
                 return self::FAILURE;
             }

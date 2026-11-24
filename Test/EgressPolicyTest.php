@@ -188,7 +188,7 @@ final class EgressPolicyTest extends Base
 
         $transport = new FakeTransport([new Response(200, [], '{"results":[{},{}]}')]);
         $osv = new Osv(new Client($transport, 'https://kanboard.example'), $pdo);
-        $osv->queryPending(7);
+        $osv->store($osv->fetch($osv->dueRows(7), []));
         self::assertTrue(
             array_column($transport->requests, 'body') === [
                 '{"queries":[{"package":{"ecosystem":"npm","name":"lodash"},"version":"4.17.20"},'
@@ -197,7 +197,8 @@ final class EgressPolicyTest extends Base
             'Only the two valid public queries may reach the transport.',
         );
         self::assertSame([1 => [], 4 => []], $osv->results(7));
-        self::assertNull($osv->queryPending(8));
+        $osv->store($osv->fetch($osv->dueRows(8), []));
+        self::assertNull($osv->pendingRetryAt(8));
         self::assertCount(1, $transport->requests);
         self::assertSame([], $osv->results(8));
         self::assertSame(
