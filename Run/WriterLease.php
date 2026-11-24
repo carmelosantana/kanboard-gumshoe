@@ -6,7 +6,6 @@ use Closure;
 use LogicException;
 use PDO;
 use PDOStatement;
-use RuntimeException;
 use Throwable;
 
 final readonly class WriterLease
@@ -143,8 +142,4 @@ final readonly class WriterLease
             }
         };
     }
-}
-
-final class LeaseLost extends RuntimeException
-{
 }

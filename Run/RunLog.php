@@ -2,6 +2,7 @@
 
 namespace Kanboard\Plugin\Gumshoe\Run;
 
+use Kanboard\Plugin\Gumshoe\Advisory\AdvisoryCache;
 use PDO;
 use PDOStatement;
 
@@ -45,10 +46,41 @@ final readonly class RunLog
 
     public function finish(int $id, string $status, int $now, ?string $error = null, ?int $retryAt = null): void
     {
+        $this->retirePending($id);
         $this->execute(
             'UPDATE gumshoe_runs SET status = ?, finished_at = ?, exception_class = ?, retry_at = ? WHERE id = ?',
             [$status, $now, $error, $retryAt, $id],
         );
+    }
+
+    private function retirePending(int $id): void
+    {
+        // Osv associates answers with pending row IDs while matching a run.
+        // Once that run is terminal, retain only the latest answer per identity.
+        $cast = $this->pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? 'CHAR' : 'TEXT';
+        $rows = $this->rows("SELECT p.query_type, p.ecosystem, p.name, p.version, c.body, c.fetched_at
+            FROM gumshoe_pending p JOIN gumshoe_advisory_cache c ON c.source = 'osv-query'
+                AND c.advisory_id = CAST(p.id AS $cast)
+            WHERE p.run_id = ? AND p.state = 'done' AND p.egress = 'public'", [$id]);
+        $cache = new AdvisoryCache($this->pdo);
+        foreach ($rows as $row) {
+            $key = 'query:'.hash('sha256', json_encode(
+                [$row['query_type'], $row['ecosystem'], $row['name'], $row['version']],
+                JSON_THROW_ON_ERROR,
+            ));
+            $fetchedAt = (int) $row['fetched_at'];
+            if (($cache->get('osv-query', $key)['fetched_at'] ?? 0) <= $fetchedAt) {
+                $cache->put('osv-query', $key, json_decode($row['body'], true, flags: JSON_THROW_ON_ERROR), null, $fetchedAt);
+            }
+        }
+        $this->execute("DELETE FROM gumshoe_advisory_cache WHERE source = 'osv-query' AND advisory_id IN
+            (SELECT CAST(id AS $cast) FROM gumshoe_pending WHERE run_id = ?)", [$id]);
+        $this->execute('DELETE FROM gumshoe_pending WHERE run_id = ?', [$id]);
+    }
+
+    public function defer(int $id, int $retryAt): void
+    {
+        $this->execute('UPDATE gumshoe_runs SET retry_at = ? WHERE id = ?', [$retryAt, $id]);
     }
 
     public function counts(int $id): array

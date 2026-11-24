@@ -110,6 +110,7 @@ final class ScannerTest extends Base
         self::assertSame('affected', $this->repoState());
 
         $this->version = '0.1.2';
+        $this->pdo->exec("UPDATE gumshoe_deps SET version = '0.1.2'");
         self::assertSame('done', $this->scanner()->tick(self::RECHECK, 'cli')['status']);
         self::assertSame('affected', $this->repoState());
         $this->requests = [];
@@ -117,6 +118,74 @@ final class ScannerTest extends Base
         self::assertStringContainsString('"version":"0.1.2"', $this->osvRequestBody());
         self::assertSame('fixed', $this->repoState());
         self::assertSame('fixed', $this->findingStatus());
+    }
+
+    public function testTerminalRunsFreePendingRowsAndKeepOneAnswerPerIdentity(): void
+    {
+        self::assertSame('done', $this->scanner()->tick(self::INVENTORY, 'cli')['status']);
+        self::assertSame(0, (int) $this->pdo->query('SELECT COUNT(*) FROM gumshoe_pending')->fetchColumn());
+        $this->vulnerable = false;
+        self::assertSame('done', $this->scanner()->tick(self::RECHECK, 'cli')['status']);
+        self::assertSame(0, (int) $this->pdo->query('SELECT COUNT(*) FROM gumshoe_pending')->fetchColumn());
+        self::assertSame(['[]'], $this->pdo->query("SELECT body FROM gumshoe_advisory_cache WHERE source = 'osv-query'")->fetchAll(PDO::FETCH_COLUMN));
+    }
+
+    public function testDiscoveryUnitWithoutProgressFailsAfterThreeSlices(): void
+    {
+        $scanner = $this->scanner(function (Request $request): Response {
+            $this->now++;
+            return new Response(200, [
+                'Link' => '<https://api.github.com/organizations/17/repos?type=all&page=2>; rel="next"',
+            ], $this->listing()->body);
+        });
+        foreach (['more', 'more', 'more', 'failed'] as $status) {
+            self::assertSame($status, $scanner->tick(self::INVENTORY, 'foreman', $this->now + 1)['status']);
+        }
+        self::assertSame('discover', $this->latest()['phase']);
+        self::assertSame('1', $this->latest()['position']);
+    }
+
+    /** @dataProvider unexpectedFailureRecovery */
+    public function testUnexpectedExceptionsHaveTheirOwnRetryBudget(bool $recover): void
+    {
+        $throwOnNextClockRead = false;
+        $httpFails = false;
+        $scanner = $this->scanner(
+            function (Request $request) use (&$throwOnNextClockRead, &$httpFails): Response {
+                if ($request->operation === 'gh.advisories') {
+                    if ($httpFails) {
+                        return new Response(503);
+                    }
+                    $throwOnNextClockRead = true;
+                }
+                return $this->respond($request);
+            },
+            function () use (&$throwOnNextClockRead): int {
+                if ($throwOnNextClockRead) {
+                    $throwOnNextClockRead = false;
+                    throw new \LogicException('internal exception message');
+                }
+                return $this->now;
+            },
+        );
+        self::assertSame('more', $scanner->tick(self::INVENTORY, 'cli')['status']);
+        $run = $this->latest();
+        self::assertNull($run['exception_class']);
+        self::assertStringNotContainsString('internal exception message', json_encode($run));
+        $this->now = (int) $run['retry_at'];
+        $httpFails = $recover;
+        self::assertSame('more', $scanner->tick(self::INVENTORY, 'cli')['status']);
+        $this->now = (int) $this->latest()['retry_at'];
+        self::assertSame('failed', $scanner->tick(self::INVENTORY, 'cli')['status']);
+        self::assertSame($run['id'], $this->latest()['id']);
+        self::assertSame($recover ? \Kanboard\Plugin\Gumshoe\Http\HttpFailure::class : \LogicException::class,
+            $this->latest()['exception_class']);
+    }
+
+    public static function unexpectedFailureRecovery(): iterable
+    {
+        yield 'three unexpected failures' => [false];
+        yield 'HTTP still gets its retry after an unexpected exception' => [true];
     }
 
     public function testDisabledJobsAndHourlyRecheckWithoutGithub(): void
@@ -202,13 +271,14 @@ final class ScannerTest extends Base
         $run = $this->latest();
         self::assertGreaterThanOrEqual($this->now + 60, (int) $run['retry_at']);
         $count = count($this->requests);
-        self::assertSame('more', $scanner->tick(self::INVENTORY, 'foreman')['status']);
+        self::assertSame('done', $scanner->tick(self::INVENTORY, 'foreman')['status']);
         self::assertCount($count, $this->requests);
         $this->now = (int) $run['retry_at'];
         $result = $scanner->tick(self::INVENTORY, 'foreman');
         self::assertSame('failed', $result['status']);
         self::assertSame($run['id'], $this->latest()['id']);
         self::assertSame('failed', $this->latest()['status']);
+        self::assertSame(0, (int) $this->pdo->query('SELECT COUNT(*) FROM gumshoe_pending')->fetchColumn());
         self::assertSame(\Kanboard\Plugin\Gumshoe\Http\HttpFailure::class, $this->latest()['exception_class']);
         self::assertStringNotContainsString('upstream diagnostic', json_encode([$result, $this->latest()]));
     }
@@ -277,7 +347,7 @@ final class ScannerTest extends Base
         self::fail('No OSV query recorded.');
     }
 
-    private function scanner(?\Closure $responder = null): Scanner
+    private function scanner(?\Closure $responder = null, ?\Closure $clock = null): Scanner
     {
         $send = function (Request $request) use ($responder): Response {
             $this->requests[] = $request;
@@ -291,7 +361,7 @@ final class ScannerTest extends Base
                 return ($this->send)($request);
             }
         };
-        return new Scanner($this->container, $transport, 'https://kanboard.example', fn (): int => $this->now);
+        return new Scanner($this->container, $transport, 'https://kanboard.example', $clock ?? fn (): int => $this->now);
     }
 
     private function listing(): Response
