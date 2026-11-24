@@ -21,7 +21,8 @@ final class BoardSync extends Base
     /**
      * Sync one persisted finding under the scanner's single writer lease.
      * Repo transitions from Reconciler, when available, are keyed by repo ID.
-     * Returns project_unavailable when the configured or actual board is unsafe.
+     * Returns project_unavailable for an unsafe board or task_recovery_ambiguous
+     * when an interrupted create has multiple matching tasks.
      */
     public function sync(int $findingId, int $targetProject, int $runId, array $repoTransitions = []): ?string
     {
@@ -43,11 +44,37 @@ final class BoardSync extends Base
 
         $reference = 'gumshoe:finding:'.$findingId;
         $task = $this->findTask($finding);
+        if ($task === null) {
+            return $this->recordIssue($runId, 'task_recovery_ambiguous');
+        }
+        if ($task !== [] && $this->privateProject((int) $task['project_id']) === []) {
+            return $this->unavailable($runId, (int) $task['project_id']);
+        }
+
+        $previousProject = (int) $finding['project_id'];
+        $priority = Priority::of($finding);
+        if ($task === [] && $finding['task_id'] !== null && (int) $finding['task_id'] === 0) {
+            (new FindingModel($this->db->getConnection()))->transaction(function () use ($finding, $previousProject, $priority): array {
+                // The inserted task was deleted before its subtasks were linked.
+                // Already affected repos are the baseline for future escalations.
+                $this->sql('UPDATE gumshoe_finding_repos SET subtask_id = 0
+                    WHERE finding_id = ? AND ever_affected = 1 AND subtask_id IS NULL', [$finding['id']]);
+                $this->persist($finding, null, $previousProject, 'dismissed', $priority, null, null);
+
+                return [];
+            });
+
+            return null;
+        }
+
         $absorbed = $this->absorbedFindings($finding);
-        if ($absorbed !== []) {
+        if ($absorbed !== [] && ($task !== [] || $previousProject === 0)) {
             $merge = $this->mergeBoardTasks($finding, $task, $absorbed, $targetProject, $reference);
             if (isset($merge['unavailable'])) {
                 return $this->unavailable($runId, $targetProject, $merge['unavailable']);
+            }
+            if (isset($merge['ambiguous'])) {
+                return $this->recordIssue($runId, 'task_recovery_ambiguous');
             }
             if (isset($merge['retry'])) {
                 return null;
@@ -56,7 +83,6 @@ final class BoardSync extends Base
         }
 
         $previousProject = (int) $finding['project_id'];
-        $priority = Priority::of($finding);
         $repos = $this->repos($findingId);
         $affected = array_filter($repos, static fn (array $repo): bool => $repo['state'] === 'affected');
         $allFixed = $repos !== [] && array_all($repos, static fn (array $repo): bool => $repo['state'] === 'fixed');
@@ -94,8 +120,7 @@ final class BoardSync extends Base
             return null;
         }
 
-        $projectId = $task !== [] ? (int) $task['project_id'] :
-            ($finding['task_id'] !== null ? $previousProject : $targetProject);
+        $projectId = $task !== [] ? (int) $task['project_id'] : ($previousProject ?: $targetProject);
         $project = $this->privateProject($projectId);
         if ($project === []) {
             return $this->unavailable($runId, $targetProject, $projectId);
@@ -190,7 +215,8 @@ final class BoardSync extends Base
         return isset($result['unavailable']) ? $this->unavailable($runId, $targetProject, $result['unavailable']) : null;
     }
 
-    private function findTask(array $finding): array
+    /** An empty array means absent, and null means recovery is ambiguous. */
+    private function findTask(array $finding): ?array
     {
         $reference = 'gumshoe:finding:'.$finding['id'];
         if ($finding['task_id'] > 0) {
@@ -198,10 +224,26 @@ final class BoardSync extends Base
 
             return ($task['reference'] ?? null) === $reference ? $task : [];
         }
-        if ($finding['task_id'] !== null && (int) $finding['project_id'] > 0) {
-            // A person can move an interrupted create before recovery. This
-            // project-scoped lookup accepts a duplicate in that window.
-            return $this->recoverTask((int) $finding['project_id'], $reference);
+        if ($finding['task_id'] !== null) {
+            // A task can move after the insert, so search all projects.
+            // Retired tasks keep their original reference and history.
+            $rows = $this->sql(
+                'SELECT t.* FROM tasks t WHERE t.reference = ?
+                 AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.task_id = t.id AND c.user_id = 0 AND c.comment LIKE ?)',
+                [$reference, self::MERGED_COMMENT_PATTERN],
+            );
+            $candidate = [];
+            while ($row = $rows->fetch(PDO::FETCH_ASSOC)) {
+                if ($row['reference'] !== $reference) {
+                    continue;
+                }
+                if ($candidate !== []) {
+                    return null;
+                }
+                $candidate = $row;
+            }
+
+            return $candidate;
         }
 
         return [];
@@ -429,6 +471,9 @@ final class BoardSync extends Base
         $closed = [];
         foreach ($absorbed as $other) {
             $task = $this->findTask($other);
+            if ($task === null) {
+                return ['ambiguous' => true];
+            }
             if (!empty($task['is_active'])) {
                 $active[] = [$other, $task];
             } elseif ($task !== [] && !$this->hasMergeComment((int) $task['id'])) {
@@ -651,20 +696,28 @@ final class BoardSync extends Base
 
     private function unavailable(int $runId, int ...$projects): string
     {
-        $value = $this->sql('SELECT counts FROM gumshoe_runs WHERE id = ?', [$runId])->fetchColumn();
-        $this->check($value !== false, 'record unavailable project for run');
-        $counts = json_decode($value, true, flags: JSON_THROW_ON_ERROR);
-        $counts['project_unavailable'] = ($counts['project_unavailable'] ?? 0) + 1;
         foreach (array_unique($projects) as $project) {
             $row = $this->projectModel->getById($project);
             if (!empty($row['is_public'])) {
-                $counts['project_unavailable_message'] = self::PUBLIC_BOARD_MESSAGE;
-                break;
+                return $this->recordIssue($runId, 'project_unavailable', self::PUBLIC_BOARD_MESSAGE);
             }
+        }
+
+        return $this->recordIssue($runId, 'project_unavailable');
+    }
+
+    private function recordIssue(int $runId, string $issue, ?string $message = null): string
+    {
+        $value = $this->sql('SELECT counts FROM gumshoe_runs WHERE id = ?', [$runId])->fetchColumn();
+        $this->check($value !== false, 'record board sync issue for run');
+        $counts = json_decode($value, true, flags: JSON_THROW_ON_ERROR);
+        $counts[$issue] = ($counts[$issue] ?? 0) + 1;
+        if ($message !== null) {
+            $counts[$issue.'_message'] = $message;
         }
         $this->sql('UPDATE gumshoe_runs SET counts = ? WHERE id = ?', [json_encode($counts, JSON_THROW_ON_ERROR), $runId]);
 
-        return 'project_unavailable';
+        return $issue;
     }
 
     private function comment(int $taskId, string $text): void

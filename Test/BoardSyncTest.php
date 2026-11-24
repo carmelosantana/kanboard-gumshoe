@@ -366,6 +366,37 @@ final class BoardSyncTest extends Base
         self::assertTrue($this->container['taskStatusModel']->isClosed($closed));
     }
 
+    public static function deletionTiming(): array
+    {
+        return ['recorded' => [true], 'before sync' => [false]];
+    }
+
+    /** @dataProvider deletionTiming */
+    public function testDeletedSurvivorLeavesActiveAbsorbedTaskUntouched(bool $recordDeletion): void
+    {
+        $this->addMergeFinding();
+        $this->sync();
+        $this->sync(2);
+        $deleted = (int) $this->finding()['task_id'];
+        $absorbed = (int) $this->finding(2)['task_id'];
+        self::assertTrue($this->container['taskModel']->remove($deleted));
+        if ($recordDeletion) {
+            $this->sync();
+        }
+        $before = $this->container['taskFinderModel']->getById($absorbed);
+        $this->mergeInto(1, 2);
+
+        $this->sync(2);
+        $this->sync();
+        self::assertNull($this->finding()['task_id']);
+        self::assertSame('dismissed', $this->finding()['status']);
+        self::assertSame('merged', $this->finding(2)['status']);
+        self::assertSame($before, $this->container['taskFinderModel']->getById($absorbed));
+        self::assertTrue($this->container['taskStatusModel']->isOpen($absorbed));
+        self::assertSame([], $this->comments($absorbed));
+        self::assertSame(1, $this->container['taskFinderModel']->countByProjectId($this->project));
+    }
+
     public function testMergeKeepsFixedTaskClosedWhenAbsorbedTaskWasJustDismissed(): void
     {
         $this->addMergeFinding();
@@ -632,18 +663,117 @@ final class BoardSyncTest extends Base
         self::assertArrayHasKey('project_unavailable', $counts);
     }
 
-    public function testClaimRecoveryDoesNotUseMatchingReferenceOnAnotherBoard(): void
+    public static function recreationBoards(): array
     {
+        return ['private' => ['private'], 'public' => ['public'], 'missing' => ['missing']];
+    }
+
+    /** @dataProvider recreationBoards */
+    public function testEscalationAfterDeletionUsesOriginalBoard(string $visibility): void
+    {
+        $this->sync();
+        $original = $this->project;
+        self::assertTrue($this->container['taskModel']->remove((int) $this->finding()['task_id']));
+        $this->sync();
+        $this->project = $this->container['projectModel']->create(['name' => 'New findings']);
+        if ($visibility === 'public') {
+            $this->container['projectModel']->update(['id' => $original, 'is_public' => 1]);
+        } elseif ($visibility === 'missing') {
+            self::assertTrue($this->container['projectModel']->remove($original));
+        }
+
+        $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 1');
+        $result = $this->sync();
+
+        self::assertSame(0, $this->container['taskFinderModel']->countByProjectId($this->project));
+        self::assertSame($original, (int) $this->finding()['project_id']);
+        if ($visibility === 'private') {
+            self::assertNull($result);
+            $task = $this->container['taskFinderModel']->getByReference($original, 'gumshoe:finding:1');
+            self::assertNotEmpty($task);
+            self::assertSame((int) $task['id'], (int) $this->finding()['task_id']);
+            self::assertSame('open', $this->finding()['status']);
+        } else {
+            self::assertSame('project_unavailable', $result);
+            self::assertNull($this->finding()['task_id']);
+            self::assertSame('dismissed', $this->finding()['status']);
+            self::assertSame('normal', $this->finding()['observed_priority']);
+            self::assertSame(0, $this->container['taskFinderModel']->countByProjectId($original));
+        }
+    }
+
+    public function testInterruptedCreateFollowsTaskMovedToPrivateBoard(): void
+    {
+        $id = $this->interruptTaskCreation();
         $other = $this->container['projectModel']->create(['name' => 'Other']);
-        $foreign = $this->container['taskCreationModel']->create([
-            'project_id' => $other, 'title' => 'Other task', 'reference' => 'gumshoe:finding:1',
-        ]);
-        $this->pdo->exec("UPDATE gumshoe_findings SET project_id = $this->project, task_id = 0 WHERE id = 1");
+        self::assertTrue($this->container['taskProjectMoveModel']->moveToProject($id, $other));
+
+        $this->sync();
         $this->sync();
 
-        self::assertNotSame($foreign, (int) $this->finding()['task_id']);
+        self::assertSame($id, (int) $this->finding()['task_id']);
+        self::assertSame($other, (int) $this->finding()['project_id']);
+        self::assertSame(0, $this->container['taskFinderModel']->countByProjectId($this->project));
+        self::assertSame(1, $this->container['taskFinderModel']->countByProjectId($other));
+        self::assertSame(['symfony/yaml'], array_column($this->container['subtaskModel']->getAll($id), 'title'));
+    }
+
+    public function testInterruptedCreateLeavesTaskMovedToPublicBoardUntouched(): void
+    {
+        $id = $this->interruptTaskCreation();
+        $other = $this->container['projectModel']->create(['name' => 'Other']);
+        self::assertTrue($this->container['taskProjectMoveModel']->moveToProject($id, $other));
+        $this->container['projectModel']->update(['id' => $other, 'is_public' => 1]);
+        $before = $this->container['taskFinderModel']->getById($id);
+        $claim = $this->finding();
+
+        self::assertSame('project_unavailable', $this->sync());
+        self::assertSame($claim, $this->finding());
+        self::assertSame($before, $this->container['taskFinderModel']->getById($id));
+        self::assertSame([], $this->container['subtaskModel']->getAll($id));
+        self::assertSame(0, $this->container['taskFinderModel']->countByProjectId($this->project));
+        $counts = json_decode($this->pdo->query('SELECT counts FROM gumshoe_runs WHERE id = 1')->fetchColumn(), true);
+        self::assertSame(BoardSync::PUBLIC_BOARD_MESSAGE, $counts['project_unavailable_message'] ?? null);
+    }
+
+    public function testInterruptedCreateDismissesDeletedTaskUntilEscalation(): void
+    {
+        $id = $this->interruptTaskCreation();
+        self::assertTrue($this->container['taskModel']->remove($id));
+
+        $this->sync();
+        $this->sync();
+
+        self::assertNull($this->finding()['task_id']);
+        self::assertSame('dismissed', $this->finding()['status']);
         self::assertSame($this->project, (int) $this->finding()['project_id']);
-        self::assertSame([], $this->container['subtaskModel']->getAll($foreign));
+        self::assertSame(0, $this->container['taskFinderModel']->countByProjectId($this->project));
+
+        $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 1');
+        $this->sync();
+        self::assertSame('open', $this->finding()['status']);
+        self::assertSame(1, $this->container['taskFinderModel']->countByProjectId($this->project));
+    }
+
+    public function testInterruptedCreateWithAmbiguousReferenceLogsAndLeavesBothTasksUntouched(): void
+    {
+        $id = $this->interruptTaskCreation();
+        $other = $this->container['projectModel']->create(['name' => 'Other']);
+        $duplicate = $this->container['taskCreationModel']->create([
+            'project_id' => $other, 'title' => 'Other task', 'reference' => 'gumshoe:finding:1',
+        ]);
+        $finder = $this->container['taskFinderModel'];
+        $before = [$finder->getById($id), $finder->getById($duplicate)];
+        $claim = $this->finding();
+
+        $this->sync();
+
+        self::assertSame($claim, $this->finding());
+        self::assertSame($before, [$finder->getById($id), $finder->getById($duplicate)]);
+        self::assertSame([], $this->container['subtaskModel']->getAll($id));
+        self::assertSame([], $this->container['subtaskModel']->getAll($duplicate));
+        $counts = json_decode($this->pdo->query('SELECT counts FROM gumshoe_runs WHERE id = 1')->fetchColumn(), true);
+        self::assertSame(1, $counts['task_recovery_ambiguous'] ?? null);
     }
 
     public function testMovedTaskOnPublicBoardGetsNoWrites(): void
@@ -705,6 +835,23 @@ final class BoardSyncTest extends Base
     private function subtaskStatuses(int $taskId): array
     {
         return array_map('intval', array_column($this->container['subtaskModel']->getAll($taskId), 'status'));
+    }
+
+    private function interruptTaskCreation(): int
+    {
+        $interrupt = true;
+        $this->container['hook']->on('model:task:creation:aftersave', static function () use (&$interrupt) {
+            if ($interrupt) {
+                $interrupt = false;
+                throw new RuntimeException('Task interrupted');
+            }
+        });
+        $this->assertInterrupted('Task interrupted');
+        $task = $this->container['taskFinderModel']->getByReference($this->project, 'gumshoe:finding:1');
+        self::assertNotEmpty($task);
+        self::assertSame(0, (int) $this->finding()['task_id']);
+
+        return (int) $task['id'];
     }
 
     private function assertInterrupted(string $message): void
