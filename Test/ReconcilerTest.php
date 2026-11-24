@@ -99,6 +99,7 @@ final class ReconcilerTest extends TestCase
         $this->pdo->prepare('UPDATE gumshoe_repos SET outcome = ? WHERE id = 1')->execute([$outcome]);
         $this->pdo->exec('DELETE FROM gumshoe_deps');
         $transitions = $this->reconcile($outcome);
+        self::assertSame($outcome, $transitions[1]['outcome'] ?? null);
         self::assertSame("octokit/rest.js is no longer scanned ($outcome); its status is unknown.", $transitions[1]['comment']);
         self::assertSame([], $this->reconcile($outcome));
         self::assertSame('unknown', $this->repoState(1)['state']);
@@ -239,7 +240,7 @@ final class ReconcilerTest extends TestCase
         self::assertSame(['affected', 'unknown'], array_column([$this->repoState(1, 2), $this->repoState(2, 2)], 'state'));
         self::assertSame(1, (int) $this->repoState(2, 2)['ever_affected']);
         self::assertSame(8, (int) $this->repoState(1, 2)['subtask_id']);
-        self::assertNull($this->repoState(2, 2)['subtask_id']);
+        self::assertSame(0, (int) $this->repoState(2, 2)['subtask_id']);
         self::assertSame(0, (int) $this->pdo->query('SELECT COUNT(*) FROM gumshoe_finding_repos WHERE finding_id = 1')->fetchColumn());
         self::assertSame([1, 1], $this->activeFlags());
         self::assertSame([2, 2], array_map('intval', $this->pdo->query(

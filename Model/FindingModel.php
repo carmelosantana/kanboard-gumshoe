@@ -151,8 +151,13 @@ final class FindingModel
                 $state = $existing['state'];
             }
 
-            // A subtask ID belongs to the original task. Keep only the survivor's ID.
+            // A subtask ID belongs to its task. Mark inherited repos as known
+            // until board sync can link them to the survivor's subtasks.
             $this->writeRepoState($survivorId, $repoId, $state, $row['ever_affected'] || !empty($existing['ever_affected']), $existing !== false);
+            if ((int) $row['ever_affected']) {
+                $this->execute('UPDATE gumshoe_finding_repos SET subtask_id = 0
+                    WHERE finding_id = ? AND repo_id = ? AND subtask_id IS NULL', [$survivorId, $repoId]);
+            }
         }
         $this->execute('DELETE FROM gumshoe_finding_repos WHERE finding_id = ?', [$absorbedId]);
     }

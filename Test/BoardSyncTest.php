@@ -2,9 +2,11 @@
 
 namespace Kanboard\Plugin\Gumshoe\Test;
 
+use Kanboard\Model\CommentModel;
 use Kanboard\Model\SubtaskModel;
 use Kanboard\Model\TaskCreationModel;
 use Kanboard\Model\TaskFinderModel;
+use Kanboard\Model\TaskStatusModel;
 use Kanboard\Plugin\Gumshoe\Finding\BoardSync;
 use Kanboard\Plugin\Gumshoe\Model\FindingModel;
 use KanboardTests\units\Base;
@@ -34,7 +36,7 @@ final class BoardSyncTest extends Base
             INSERT INTO gumshoe_owners (id, login, kind) VALUES (1, 'symfony', 'org');
             INSERT INTO gumshoe_repos (id, owner_id, name, github_id) VALUES (1, 1, 'yaml', 1), (2, 1, 'console', 2);
             INSERT INTO gumshoe_groups (id, primary_id) VALUES (1, 'CVE-2018-16492'), (2, 'GHSA-mh6f-8j2x-4483');
-            INSERT INTO gumshoe_findings (id, group_id, ecosystem, package) VALUES (1, 1, 'npm', 'flatmap-stream');
+            INSERT INTO gumshoe_findings (group_id, ecosystem, package) VALUES (1, 'npm', 'flatmap-stream');
             INSERT INTO gumshoe_finding_repos (finding_id, repo_id, state, ever_affected) VALUES (1, 1, 'affected', 1);
             SQL);
         $trigger = DB_DRIVER === 'mysql' ? '`trigger`' : '"trigger"';
@@ -92,7 +94,103 @@ final class BoardSyncTest extends Base
         };
 
         $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('Gumshoe could not create task.');
         $this->sync();
+    }
+
+    public function testFalseSubtaskCreateFails(): void
+    {
+        $this->container['subtaskModel'] = new class($this->container) extends SubtaskModel {
+            public function create(array $values)
+            {
+                return false;
+            }
+        };
+
+        $this->assertInterrupted('Gumshoe could not create subtask.');
+        $this->container['subtaskModel'] = new SubtaskModel($this->container);
+        $this->sync();
+        self::assertCount(1, $this->container['subtaskModel']->getAll((int) $this->finding()['task_id']));
+        self::assertSame(1, $this->container['taskFinderModel']->countByProjectId($this->project));
+    }
+
+    public function testFalseCommentCreateRollsBackFix(): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'fixed'");
+        $this->container['commentModel'] = new class($this->container) extends CommentModel {
+            public function create(array $values)
+            {
+                return false;
+            }
+        };
+
+        $this->assertInterrupted('Gumshoe could not create comment.');
+        self::assertTrue($this->container['taskStatusModel']->isOpen($id));
+        self::assertSame([SubtaskModel::STATUS_TODO], $this->subtaskStatuses($id));
+    }
+
+    public function testFalseTaskCloseRollsBackFix(): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'fixed'");
+        $this->container['taskStatusModel'] = new class($this->container) extends TaskStatusModel {
+            public function close($task_id)
+            {
+                return false;
+            }
+        };
+
+        $this->assertInterrupted('Gumshoe could not close task.');
+        self::assertSame([], $this->comments($id));
+        self::assertSame([SubtaskModel::STATUS_TODO], $this->subtaskStatuses($id));
+    }
+
+    public function testPersonCanReopenFixedTaskAndNewEvidenceResetsTheOverride(): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'fixed'");
+        $this->sync();
+        self::assertTrue($this->container['taskStatusModel']->open($id));
+        $this->sync();
+        $this->sync(1, [1 => ['to' => 'fixed']]);
+        self::assertTrue($this->container['taskStatusModel']->isOpen($id));
+        self::assertSame('fixed', $this->finding()['status']);
+        self::assertGreaterThan(0, (int) $this->finding()['reopened_by_person_at']);
+        self::assertSame(['Fixed in symfony/yaml.', 'Fixed in all repos.'], $this->comments($id));
+
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'affected'");
+        $this->sync();
+        self::assertSame('open', $this->finding()['status']);
+        self::assertNull($this->finding()['reopened_by_person_at']);
+        self::assertSame([SubtaskModel::STATUS_TODO], $this->subtaskStatuses($id));
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'fixed'");
+        $this->sync();
+        self::assertTrue($this->container['taskStatusModel']->isClosed($id));
+        self::assertCount(4, $this->comments($id));
+    }
+
+    public function testDismissedTaskGetsNoFixComment(): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        self::assertTrue($this->container['taskStatusModel']->close($id));
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'fixed'");
+        $this->sync(1, [1 => ['to' => 'fixed']]);
+        self::assertSame('dismissed', $this->finding()['status']);
+        self::assertSame([], $this->comments($id));
+    }
+
+    public function testUnknownTransitionUsesOutcomeField(): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'unknown'");
+        $this->sync(1, [1 => ['to' => 'unknown', 'outcome' => 'inaccessible']]);
+        self::assertSame(['symfony/yaml is no longer scanned (inaccessible); its status is unknown.'], $this->comments($id));
     }
 
     public function testFixClosesSubtaskAndThenTaskExactlyOnce(): void
@@ -100,6 +198,9 @@ final class BoardSyncTest extends Base
         $this->addRepo();
         $this->sync();
         $id = (int) $this->finding()['task_id'];
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'unknown' WHERE repo_id = 1");
+        $this->sync();
+        self::assertStringEndsWith('(1 repo)', $this->container['taskFinderModel']->getById($id)['title']);
         $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'fixed' WHERE repo_id = 1");
         $this->sync();
         self::assertSame([SubtaskModel::STATUS_DONE, SubtaskModel::STATUS_TODO], $this->subtaskStatuses($id));
@@ -110,6 +211,7 @@ final class BoardSyncTest extends Base
         $this->sync();
         self::assertTrue($this->container['taskStatusModel']->isClosed($id));
         self::assertSame('fixed', $this->finding()['status']);
+        self::assertStringEndsWith('(1 repo)', $this->container['taskFinderModel']->getById($id)['title']);
         self::assertGreaterThan(0, (int) $this->finding()['closed_by_gumshoe_at']);
         self::assertSame(['Fixed in symfony/yaml.', 'Fixed in symfony/console.', 'Fixed in all repos.'], $this->comments($id));
     }
@@ -182,12 +284,25 @@ final class BoardSyncTest extends Base
         self::assertSame([], $this->comments($id));
     }
 
-    public function testMergeFollowsPersistedSurvivorAndRestoresItsAffectedRepos(): void
+    public static function mergeEscalations(): array
+    {
+        return [
+            'alias merge alone' => [null, false],
+            'higher priority carried by the merge' => ['before', false],
+            'higher priority with no snapshot' => ['after', true],
+        ];
+    }
+
+    /** @dataProvider mergeEscalations */
+    public function testMergeWithExistingTaskOnlyReopensForEscalation(?string $priorityChange, bool $missingSnapshot): void
     {
         $this->pdo->exec(<<<'SQL'
-            INSERT INTO gumshoe_findings (id, group_id, ecosystem, package) VALUES (2, 2, 'npm', 'flatmap-stream');
+            INSERT INTO gumshoe_findings (group_id, ecosystem, package) VALUES (2, 'npm', 'flatmap-stream');
             INSERT INTO gumshoe_finding_repos (finding_id, repo_id, state, ever_affected) VALUES (2, 2, 'affected', 1)
             SQL);
+        if ($priorityChange === 'before') {
+            $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 2');
+        }
         $this->sync();
         $this->sync(2);
         $survivor = (int) $this->finding()['task_id'];
@@ -196,21 +311,93 @@ final class BoardSyncTest extends Base
         $this->sync();
         $this->pdo->exec('UPDATE gumshoe_groups SET merged_into = 1 WHERE id = 2');
         (new FindingModel($this->pdo))->mergeAbsorbedFindings();
+        if ($priorityChange !== null) {
+            $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 1');
+        }
+        if ($missingSnapshot) {
+            $this->pdo->exec('UPDATE gumshoe_findings SET observed_status = NULL, observed_priority = NULL,
+                observed_kev = NULL, observed_malware = NULL WHERE id = 1');
+        }
+        $escalates = $priorityChange !== null;
 
         $this->sync(2);
         $this->sync(2);
         self::assertTrue($this->container['taskStatusModel']->isClosed($absorbed));
         self::assertSame(["Merged into #$survivor."], $this->comments($absorbed));
-        self::assertTrue($this->container['taskStatusModel']->isOpen($survivor));
-        self::assertSame('open', $this->finding()['status']);
-        self::assertSame([SubtaskModel::STATUS_TODO, SubtaskModel::STATUS_TODO], $this->subtaskStatuses($survivor));
+        self::assertSame($escalates, $this->container['taskStatusModel']->isOpen($survivor));
+        self::assertSame($escalates ? 'open' : 'dismissed', $this->finding()['status']);
+        self::assertSame($escalates ? ['Reopened: priority rose to high.'] : [], $this->comments($survivor));
+        self::assertSame(array_fill(0, 2, $escalates ? SubtaskModel::STATUS_TODO : SubtaskModel::STATUS_DONE),
+            $this->subtaskStatuses($survivor));
+    }
+
+    public static function adoptionCases(): array
+    {
+        return [[false, true], [true, false]];
+    }
+
+    /** @dataProvider adoptionCases */
+    public function testFreshSurvivorAdoptsTaskAndHistory(bool $dismissed, bool $syncSurvivorFirst): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        $column = $this->container['columnModel']->create($this->project, 'Investigating');
+        $user = $this->container['userModel']->create(['username' => 'analyst']);
+        self::assertTrue($this->container['taskModificationModel']->update(['id' => $id, 'owner_id' => $user, 'column_id' => $column]));
+        self::assertGreaterThan(0, $this->container['commentModel']->create(['task_id' => $id, 'user_id' => $user, 'comment' => 'Investigating']));
+        if ($dismissed) {
+            self::assertTrue($this->container['taskStatusModel']->close($id));
+            $this->sync();
+        }
+        $this->pdo->exec('UPDATE gumshoe_groups SET merged_into = 2 WHERE id = 1');
+        $merge = (new FindingModel($this->pdo))->mergeAbsorbedFindings();
+        $survivor = $merge[1]['survivor_finding_id'];
+
+        $this->sync($syncSurvivorFirst ? $survivor : 1);
+        $this->sync($syncSurvivorFirst ? 1 : $survivor);
+        self::assertSame($id, (int) $this->finding($survivor)['task_id']);
+        self::assertSame(1, $this->container['taskFinderModel']->countByProjectId($this->project));
+        $task = $this->container['taskFinderModel']->getById($id);
+        self::assertSame("gumshoe:finding:$survivor", $task['reference']);
+        self::assertSame('[Gumshoe] flatmap-stream — GHSA-mh6f-8j2x-4483 (1 repo)', $task['title']);
+        self::assertSame($column, (int) $task['column_id']);
+        self::assertSame($user, (int) $task['owner_id']);
+        self::assertSame(['Investigating'], $this->comments($id));
+        self::assertSame(!$dismissed, (bool) $task['is_active']);
+        self::assertSame($dismissed ? 'dismissed' : 'open', $this->finding($survivor)['status']);
+    }
+
+    public function testRepeatedMergeAdoptsThePreviousSurvivorTask(): void
+    {
+        $this->pdo->exec(<<<'SQL'
+            INSERT INTO gumshoe_groups (id, primary_id) VALUES (3, 'CVE-2021-44228');
+            INSERT INTO gumshoe_findings (group_id, ecosystem, package) VALUES (2, 'npm', 'flatmap-stream');
+            INSERT INTO gumshoe_finding_repos (finding_id, repo_id, state, ever_affected) VALUES (2, 2, 'affected', 1)
+            SQL);
+        $this->sync();
+        $this->sync(2);
+        $original = (int) $this->finding()['task_id'];
+        $firstSurvivor = (int) $this->finding(2)['task_id'];
+        $findings = new FindingModel($this->pdo);
+        $this->pdo->exec('UPDATE gumshoe_groups SET merged_into = 2 WHERE id = 1');
+        $findings->mergeAbsorbedFindings();
+        $this->sync();
+        $this->pdo->exec('UPDATE gumshoe_groups SET merged_into = 3 WHERE id = 2');
+        $survivor = $findings->mergeAbsorbedFindings()[2]['survivor_finding_id'];
+        $this->sync(2);
+
+        self::assertSame($firstSurvivor, (int) $this->finding($survivor)['task_id']);
+        self::assertTrue($this->container['taskStatusModel']->isClosed($original));
+        self::assertTrue($this->container['taskStatusModel']->isOpen($firstSurvivor));
+        self::assertSame(["Merged into #$firstSurvivor."], $this->comments($original));
+        self::assertSame([], $this->comments($firstSurvivor));
     }
 
     public function testMergeOfDismissedFindingsKeepsSurvivorDismissed(): void
     {
         $this->pdo->exec(<<<'SQL'
             UPDATE gumshoe_groups SET kev = 1 WHERE id = 2;
-            INSERT INTO gumshoe_findings (id, group_id, ecosystem, package) VALUES (2, 2, 'npm', 'flatmap-stream');
+            INSERT INTO gumshoe_findings (group_id, ecosystem, package) VALUES (2, 'npm', 'flatmap-stream');
             INSERT INTO gumshoe_finding_repos (finding_id, repo_id, state, ever_affected) VALUES (2, 2, 'affected', 1)
             SQL);
         $this->sync();
@@ -242,7 +429,7 @@ final class BoardSyncTest extends Base
         self::assertTrue($this->container['taskProjectMoveModel']->moveToProject($id, $moved));
         $this->project = $new;
         $this->pdo->exec(<<<'SQL'
-            INSERT INTO gumshoe_findings (id, group_id, ecosystem, package) VALUES (2, 2, 'npm', 'flatmap-stream');
+            INSERT INTO gumshoe_findings (group_id, ecosystem, package) VALUES (2, 'npm', 'flatmap-stream');
             INSERT INTO gumshoe_finding_repos (finding_id, repo_id, state, ever_affected) VALUES (2, 2, 'affected', 1)
             SQL);
         $this->sync();
@@ -256,6 +443,11 @@ final class BoardSyncTest extends Base
     {
         $this->pdo->exec('UPDATE gumshoe_groups SET kev = 1 WHERE id = 1');
         $this->sync();
+        self::assertSame('urgent', $this->finding()['observed_priority']);
+        self::assertSame(0, (int) $this->finding()['observed_malware']);
+        self::assertSame(1, (int) $this->finding()['observed_kev']);
+        self::assertSame('open', $this->finding()['observed_status']);
+        self::assertSame(0, (int) $this->pdo->query('SELECT COUNT(*) FROM project_has_metadata')->fetchColumn());
         $id = (int) $this->finding()['task_id'];
         self::assertTrue($this->container['taskModel']->remove($id));
         $this->sync();
@@ -282,14 +474,48 @@ final class BoardSyncTest extends Base
         self::assertArrayHasKey('project_unavailable', $counts);
     }
 
+    public function testClaimRecoveryDoesNotUseMatchingReferenceOnAnotherBoard(): void
+    {
+        $other = $this->container['projectModel']->create(['name' => 'Other']);
+        $foreign = $this->container['taskCreationModel']->create([
+            'project_id' => $other, 'title' => 'Other task', 'reference' => 'gumshoe:finding:1',
+        ]);
+        $this->pdo->exec("UPDATE gumshoe_findings SET project_id = $this->project, task_id = 0 WHERE id = 1");
+        $this->sync();
+
+        self::assertNotSame($foreign, (int) $this->finding()['task_id']);
+        self::assertSame($this->project, (int) $this->finding()['project_id']);
+        self::assertSame([], $this->container['subtaskModel']->getAll($foreign));
+    }
+
+    public function testMovedTaskOnPublicBoardGetsNoWrites(): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        $public = $this->container['projectModel']->create(['name' => 'Public']);
+        self::assertTrue($this->container['taskProjectMoveModel']->moveToProject($id, $public));
+        $this->container['projectModel']->update(['id' => $public, 'is_public' => 1]);
+        $before = $this->container['taskFinderModel']->getById($id);
+        $this->addRepo();
+
+        self::assertSame('project_unavailable', $this->sync());
+        self::assertSame($before, $this->container['taskFinderModel']->getById($id));
+        self::assertSame(['symfony/yaml'], array_column($this->container['subtaskModel']->getAll($id), 'title'));
+        self::assertSame([], $this->comments($id));
+        $counts = json_decode($this->pdo->query('SELECT counts FROM gumshoe_runs WHERE id = 1')->fetchColumn(), true);
+        self::assertSame(1, $counts['project_unavailable']);
+        self::assertSame('The findings board is public; Gumshoe will not write private repo names to it.',
+            $counts['project_unavailable_message'] ?? null);
+    }
+
     private function addRepo(): void
     {
         $this->pdo->exec("INSERT INTO gumshoe_finding_repos (finding_id, repo_id, state, ever_affected) VALUES (1, 2, 'affected', 1)");
     }
 
-    private function sync(int $finding = 1): ?string
+    private function sync(int $finding = 1, array $transitions = []): ?string
     {
-        return (new BoardSync($this->container))->sync($finding, $this->project, 1);
+        return (new BoardSync($this->container))->sync($finding, $this->project, 1, $transitions);
     }
 
     private function finding(int $id = 1): array

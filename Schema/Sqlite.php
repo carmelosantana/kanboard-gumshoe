@@ -145,6 +145,11 @@ function version_1(PDO $pdo): void
             priority VARCHAR(8) NOT NULL DEFAULT 'normal',
             status VARCHAR(16) NOT NULL DEFAULT 'open',
             closed_by_gumshoe_at BIGINT,
+            reopened_by_person_at BIGINT,
+            observed_priority VARCHAR(8),
+            observed_malware SMALLINT,
+            observed_kev SMALLINT,
+            observed_status VARCHAR(16),
             last_synced_at BIGINT,
             UNIQUE (group_id, ecosystem, package)
         )

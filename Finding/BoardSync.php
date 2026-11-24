@@ -14,6 +14,8 @@ use Throwable;
 
 final class BoardSync extends Base
 {
+    public const PUBLIC_BOARD_MESSAGE = 'The findings board is public; Gumshoe will not write private repo names to it.';
+
     /**
      * Sync one persisted finding under the scanner's single writer lease.
      * Repo transitions from Reconciler, when available, are keyed by repo ID.
@@ -31,7 +33,7 @@ final class BoardSync extends Base
         }
 
         if ($this->privateProject($targetProject) === []) {
-            return $this->unavailable($runId);
+            return $this->unavailable($runId, $targetProject);
         }
         if ($finding['status'] === 'merged') {
             return $this->syncMerged($finding, $targetProject, $runId);
@@ -39,59 +41,77 @@ final class BoardSync extends Base
 
         $reference = 'gumshoe:finding:'.$findingId;
         $task = $this->findTask($finding);
+        if ($finding['task_id'] === null) {
+            $adoption = $this->adoptAbsorbedTask($finding, $targetProject, $reference);
+            if (isset($adoption['unavailable'])) {
+                return $this->unavailable($runId, $targetProject, $adoption['unavailable']);
+            }
+            if (isset($adoption['retry'])) {
+                return null;
+            }
+            if ($adoption !== []) {
+                $task = $adoption['task'];
+                $finding = $adoption['finding'];
+            }
+        }
+
         $previousProject = (int) $finding['project_id'];
-        $snapshot = $this->snapshot($finding);
         $priority = Priority::of($finding);
         $repos = $this->repos($findingId);
         $affected = array_filter($repos, static fn (array $repo): bool => $repo['state'] === 'affected');
-        $remaining = count(array_filter($repos, static fn (array $repo): bool => $repo['state'] !== 'fixed'));
-        $allFixed = $repos !== [] && $remaining === 0;
-        $mergeReopen = $finding['status'] === 'open' && ($snapshot['status'] ?? null) === 'dismissed';
+        $allFixed = $repos !== [] && array_all($repos, static fn (array $repo): bool => $repo['state'] === 'fixed');
         $status = $finding['status'];
         $closeTime = $finding['closed_by_gumshoe_at'];
+        $personReopened = $finding['reopened_by_person_at'];
 
+        $active = !empty($task['is_active']);
         if ($task === [] && $finding['task_id'] > 0) {
             $status = 'dismissed';
             $closeTime = null;
             $this->sql("UPDATE gumshoe_findings SET status = 'dismissed', task_id = NULL, closed_by_gumshoe_at = NULL WHERE id = ?", [$findingId]);
             $finding['task_id'] = null;
-        } elseif ($task !== [] && !(int) $task['is_active'] && (int) $task['date_completed'] > (int) $closeTime && !$mergeReopen) {
+        } elseif ($task !== [] && !$active && ((int) $task['date_completed'] > (int) $closeTime || $personReopened !== null)) {
             $status = 'dismissed';
+        } elseif ($active && $status === 'fixed' && $closeTime !== null) {
+            $personReopened ??= time();
         }
 
-        $reason = $status === 'dismissed' && $affected !== []
-            ? $this->escalation($finding, $snapshot, $priority, $affected, $repoTransitions)
+        $reason = ($status === 'dismissed' || $personReopened !== null)
+            ? $this->escalation($finding, $priority, $affected, $repoTransitions)
             : null;
+        if ($affected !== [] || $reason !== null) {
+            $personReopened = null;
+        }
         $reopen = $affected !== [] && (
             ($status === 'dismissed' && $reason !== null)
-            || ($status === 'fixed' && $task !== [] && (int) $task['date_completed'] === (int) $closeTime)
-            || $mergeReopen
+            || ($status === 'fixed' && $task !== [] && !$active && (int) $task['date_completed'] === (int) $closeTime)
         );
-        if ($task === [] && (!$reopen && ($status !== 'open' || $affected === []))) {
-            $this->persist($findingId, null, $previousProject, $status, $priority, $closeTime);
-            $this->saveSnapshot($previousProject, $finding, $status);
+        if ($task === [] && !$reopen && ($status !== 'open' || $affected === [])) {
+            $this->persist($finding, null, $previousProject, $status, $priority, $closeTime, $personReopened);
 
             return null;
         }
 
-        $project = $this->privateProject($task !== [] ? (int) $task['project_id'] :
-            ($finding['task_id'] !== null ? $previousProject : $targetProject));
+        $projectId = $task !== [] ? (int) $task['project_id'] :
+            ($finding['task_id'] !== null ? $previousProject : $targetProject);
+        $project = $this->privateProject($projectId);
         if ($project === []) {
-            return $this->unavailable($runId);
+            return $this->unavailable($runId, $targetProject, $projectId);
         }
-        $projectId = (int) $project['id'];
         $values = [
-            'title' => TaskText::title($finding['package'], $finding['primary_id'], $remaining),
             'description' => $this->description($finding),
             'priority' => Priority::toProject($priority, (int) $project['priority_start'], (int) $project['priority_end']),
         ];
+        if ($affected !== [] || (!$allFixed && $active && $status === 'open')) {
+            $values['title'] = TaskText::title($finding['package'], $finding['primary_id'], max(1, count($affected)));
+        }
 
         if ($task === []) {
             // Reconciliation already owns the unique finding row. Pin the
             // project before invoking core, whose after-save hook can throw.
-            $creation = $this->createTask($finding, $targetProject, $projectId, $reference, $values, $snapshot);
+            $creation = $this->createTask($finding, $targetProject, $projectId, $reference, $values);
             if (isset($creation['unavailable'])) {
-                return $this->unavailable($runId);
+                return $this->unavailable($runId, $targetProject, $projectId);
             }
             if (isset($creation['interrupted'])) {
                 throw $creation['interrupted'];
@@ -103,16 +123,20 @@ final class BoardSync extends Base
 
         $result = (new FindingModel($this->db->getConnection()))->transaction(function () use (
             $task, $taskId, $projectId, $targetProject, $finding, $repos, $repoTransitions, $status, $priority,
-            $closeTime, $allFixed, $reopen, $reason, $values,
+            $closeTime, $allFixed, $reopen, $reason, $values, $personReopened,
         ): array {
             if (!$this->lockPrivateProjects($targetProject, $projectId)) {
-                return ['unavailable' => true];
+                return ['unavailable' => $projectId];
             }
             if (!$this->lockTask($task)) {
                 $current = $this->taskFinderModel->getById($taskId) ?: [];
-                if ($current === [] || (!(int) $current['is_active'] && (int) $current['date_completed'] > (int) $closeTime)) {
-                    $this->persist((int) $finding['id'], $current === [] ? null : $taskId, $projectId, 'dismissed', $priority, $closeTime);
-                    $this->saveSnapshot($projectId, $finding, 'dismissed');
+                $currentProject = (int) ($current['project_id'] ?? $projectId);
+                if ($this->privateProject($currentProject) === []) {
+                    return ['unavailable' => $currentProject];
+                }
+                if ($current === [] || (empty($current['is_active']) && ((int) $current['date_completed'] > (int) $closeTime
+                    || $finding['reopened_by_person_at'] !== null))) {
+                    $this->persist($finding, $current === [] ? null : $taskId, $currentProject, 'dismissed', $priority, $closeTime, $personReopened);
                     // The close wins this escalation, including any new repo.
                     $this->sql('UPDATE gumshoe_finding_repos SET subtask_id = 0 WHERE finding_id = ? AND subtask_id IS NULL', [$finding['id']]);
                 }
@@ -139,25 +163,23 @@ final class BoardSync extends Base
                 }
                 $active = true;
             }
-            if ($active) {
+            if ($active && $personReopened === null) {
                 $status = 'open';
                 $closeTime = null;
             }
 
-            if ($active || $status !== 'dismissed') {
-                if (array_diff_assoc($values, array_intersect_key($task, $values)) !== []) {
-                    $this->check($this->taskModificationModel->update(['id' => $taskId] + $values), 'update task');
-                }
+            $changes = $status === 'dismissed' ? array_intersect_key($values, ['title' => true]) : $values;
+            if (array_diff_assoc($changes, array_intersect_key($task, $changes)) !== []) {
+                $this->check($this->taskModificationModel->update(['id' => $taskId] + $changes), 'update task');
             }
-            $this->syncSubtasks($taskId, $repos, $subtasks, $repoTransitions, $active);
-            if ($allFixed && $status !== 'dismissed' && $active) {
+            $this->syncSubtasks($taskId, $repos, $subtasks, $repoTransitions, $active, $active && $personReopened === null);
+            if ($allFixed && $active && $personReopened === null) {
                 $this->comment($taskId, 'Fixed in all repos.');
                 $this->check($this->taskStatusModel->close($taskId), 'close task');
                 $closeTime = (int) $this->taskFinderModel->getById($taskId)['date_completed'];
                 $status = 'fixed';
             }
-            $this->persist((int) $finding['id'], $taskId, $projectId, $status, $priority, $closeTime);
-            $this->saveSnapshot($projectId, $finding, $status);
+            $this->persist($finding, $taskId, $projectId, $status, $priority, $closeTime, $personReopened);
 
             return [];
         });
@@ -165,7 +187,7 @@ final class BoardSync extends Base
             throw $result['interrupted'];
         }
 
-        return isset($result['unavailable']) ? $this->unavailable($runId) : null;
+        return isset($result['unavailable']) ? $this->unavailable($runId, $targetProject, $result['unavailable']) : null;
     }
 
     private function findTask(array $finding): array
@@ -177,23 +199,16 @@ final class BoardSync extends Base
             return ($task['reference'] ?? null) === $reference ? $task : [];
         }
         if ($finding['task_id'] !== null && (int) $finding['project_id'] > 0) {
-            $task = $this->taskFinderModel->getByReference((int) $finding['project_id'], $reference);
-            if ($task) {
-                return $task;
-            }
-            // A task can be moved after the core insert and before the link.
-            $id = $this->sql('SELECT id FROM tasks WHERE reference = ? ORDER BY id LIMIT 1', [$reference])->fetchColumn();
-
-            return $id === false ? [] : ($this->taskFinderModel->getById((int) $id) ?: []);
+            return $this->taskFinderModel->getByReference((int) $finding['project_id'], $reference) ?: [];
         }
 
         return [];
     }
 
-    private function createTask(array $finding, int $target, int $project, string $reference, array $values, array $snapshot): array
+    private function createTask(array $finding, int $target, int $project, string $reference, array $values): array
     {
         return (new FindingModel($this->db->getConnection()))->transaction(function () use (
-            $finding, $target, $project, $reference, $values, $snapshot,
+            $finding, $target, $project, $reference, $values,
         ): array {
             if (!$this->lockPrivateProjects($target, $project)) {
                 return ['unavailable' => true];
@@ -204,9 +219,6 @@ final class BoardSync extends Base
                     [$project, $finding['id']],
                 );
                 $this->check($claim->rowCount() === 1, 'claim finding');
-                if ($snapshot !== [] && (int) $finding['project_id'] !== $project) {
-                    $this->writeSnapshot($project, (int) $finding['id'], $snapshot);
-                }
             }
 
             try {
@@ -239,57 +251,57 @@ final class BoardSync extends Base
         return array_column($rows, null, 'repo_id');
     }
 
-    private function escalation(array $finding, array $snapshot, string $priority, array $affected, array $transitions): ?string
+    private function escalation(array $finding, string $priority, array $affected, array $transitions): ?string
     {
         if ($finding['last_synced_at'] === null) {
             return null;
         }
 
         $rank = ['low' => 0, 'normal' => 1, 'high' => 2, 'urgent' => 3];
-        $previousPriority = $rank[$finding['priority']];
-        $knownMalware = !empty($snapshot['malware']);
-        $knownKev = !empty($snapshot['kev']);
-        $knownRepos = [];
-        // Merging two dismissed findings combines evidence already seen on
-        // either task. It does not itself create an escalation.
-        $absorbed = $this->sql(
-            "WITH RECURSIVE absorbed(id) AS (
-                 SELECT id FROM gumshoe_groups WHERE merged_into = ?
-                 UNION SELECT g.id FROM gumshoe_groups g JOIN absorbed a ON a.id = g.merged_into
-             )
-             SELECT f.* FROM gumshoe_findings f JOIN absorbed a ON a.id = f.group_id
-             WHERE f.ecosystem = ? AND f.package = ? AND f.status = 'merged'",
-            [$finding['group_id'], $finding['ecosystem'], $finding['package']],
-        )->fetchAll(PDO::FETCH_ASSOC);
-        foreach ($absorbed as $other) {
-            $otherSnapshot = $this->snapshot($other);
-            $knownMalware = $knownMalware || !empty($otherSnapshot['malware']);
-            $knownKev = $knownKev || !empty($otherSnapshot['kev']);
-            $previousPriority = max($previousPriority, $rank[$other['priority']]);
-            $task = $this->findTask($other);
-            if ($task !== []) {
-                foreach ($this->subtaskModel->getAll((int) $task['id']) as $subtask) {
-                    $knownRepos[$subtask['title']] = true;
-                }
+        $previousPriority = $rank[$finding['observed_priority'] ?? $finding['priority']];
+        $knownMalware = !empty($finding['observed_malware']);
+        $knownKev = !empty($finding['observed_kev']);
+        // Known severity from another dismissed finding was already accepted.
+        // An open absorbed finding can still raise the survivor's severity.
+        foreach ($this->absorbedFindings($finding) as $other) {
+            if ($other['last_synced_at'] === null || $other['observed_status'] === 'open') {
+                continue;
             }
+            $knownMalware = $knownMalware || !empty($other['observed_malware']);
+            $knownKev = $knownKev || !empty($other['observed_kev']);
+            $previousPriority = max($previousPriority, $rank[$other['observed_priority'] ?? $other['priority']]);
         }
 
-        if ($snapshot !== [] && (int) $finding['malware'] && !$knownMalware) {
+        $previouslyNonUrgent = $previousPriority < $rank['urgent'];
+        if (($finding['observed_malware'] !== null || $previouslyNonUrgent) && (int) $finding['malware'] && !$knownMalware) {
             return 'now known malware';
         }
-        if ($snapshot !== [] && (int) $finding['kev'] && !$knownKev) {
+        if (($finding['observed_kev'] !== null || $previouslyNonUrgent) && (int) $finding['kev'] && !$knownKev) {
             return 'now on CISA KEV';
         }
         if ($rank[$priority] > $previousPriority) {
             return "priority rose to $priority";
         }
         foreach ($affected as $repoId => $repo) {
-            if ($repo['subtask_id'] === null && empty($transitions[$repoId]['was_ever_affected']) && !isset($knownRepos[$repo['title']])) {
+            if ($repo['subtask_id'] === null && empty($transitions[$repoId]['was_ever_affected'])) {
                 return 'new repo affected: '.TaskText::repoInComment($repo['title']);
             }
         }
 
         return null;
+    }
+
+    private function absorbedFindings(array $finding): array
+    {
+        return $this->sql(
+            "WITH RECURSIVE absorbed(id, depth) AS (
+                 SELECT id, 1 FROM gumshoe_groups WHERE merged_into = ?
+                 UNION ALL SELECT g.id, a.depth + 1 FROM gumshoe_groups g JOIN absorbed a ON a.id = g.merged_into
+             )
+             SELECT f.* FROM gumshoe_findings f JOIN absorbed a ON a.id = f.group_id
+             WHERE f.ecosystem = ? AND f.package = ? AND f.status = 'merged' ORDER BY a.depth, f.id",
+            [$finding['group_id'], $finding['ecosystem'], $finding['package']],
+        )->fetchAll(PDO::FETCH_ASSOC);
     }
 
     private function ensureSubtasks(int $taskId, array $repos, bool $active): array
@@ -317,7 +329,7 @@ final class BoardSync extends Base
         return $subtasks;
     }
 
-    private function syncSubtasks(int $taskId, array $repos, array $subtasks, array $transitions, bool $active): void
+    private function syncSubtasks(int $taskId, array $repos, array $subtasks, array $transitions, bool $active, bool $announceFix): void
     {
         foreach ($subtasks as $repoId => $subtask) {
             $repo = $repos[$repoId];
@@ -330,8 +342,10 @@ final class BoardSync extends Base
             }
             if ($repo['state'] === 'fixed' && $status !== SubtaskModel::STATUS_DONE) {
                 $values['status'] = SubtaskModel::STATUS_DONE;
-                $this->comment($taskId, "Fixed in $name.");
-            } elseif ($repo['state'] === 'fixed' && (int) $repo['subtask_id'] > 0 && ($transition['to'] ?? null) === 'fixed') {
+                if ($announceFix) {
+                    $this->comment($taskId, "Fixed in $name.");
+                }
+            } elseif ($announceFix && $repo['state'] === 'fixed' && (int) $repo['subtask_id'] > 0 && ($transition['to'] ?? null) === 'fixed') {
                 $this->commentOnce($taskId, "Fixed in $name.");
             } elseif ($active && $repo['state'] === 'affected' && $status === SubtaskModel::STATUS_DONE) {
                 $values['status'] = SubtaskModel::STATUS_TODO;
@@ -344,8 +358,9 @@ final class BoardSync extends Base
                     [$subtask['id'], $repo['finding_id'], $repoId]);
             }
 
-            if ($active && $repo['state'] === 'unknown' && ($transition['to'] ?? null) === 'unknown' && isset($transition['comment'])) {
-                $outcome = str_contains($transition['comment'], '(inaccessible)') ? 'inaccessible' : 'out_of_watch';
+            $outcome = $transition['outcome'] ?? null;
+            if ($active && $repo['state'] === 'unknown' && ($transition['to'] ?? null) === 'unknown'
+                && in_array($outcome, ['inaccessible', 'out_of_watch'], true)) {
                 $this->commentOnce($taskId, "$name is no longer scanned ($outcome); its status is unknown.");
             }
         }
@@ -385,11 +400,68 @@ final class BoardSync extends Base
         return TaskText::description($summary, $ids, $exposures, (bool) $finding['malware'], (bool) $finding['kev']);
     }
 
+    private function adoptAbsorbedTask(array $finding, int $targetProject, string $reference): array
+    {
+        foreach ($this->absorbedFindings($finding) as $absorbed) {
+            $task = $this->findTask($absorbed);
+            if ($task === []) {
+                continue;
+            }
+
+            $project = (int) $task['project_id'];
+            return (new FindingModel($this->db->getConnection()))->transaction(function () use (
+                $finding, $absorbed, $task, $project, $targetProject, $reference,
+            ): array {
+                if (!$this->lockPrivateProjects($targetProject, $project)) {
+                    return ['unavailable' => $project];
+                }
+                if (!$this->lockTask($task)) {
+                    return ['retry' => true];
+                }
+
+                $id = (int) $task['id'];
+                $claim = $this->sql(
+                    'UPDATE gumshoe_findings SET task_id = ?, project_id = ?, closed_by_gumshoe_at = ?,
+                     reopened_by_person_at = ?, last_synced_at = ?, observed_priority = ?, observed_malware = ?, observed_kev = ?, observed_status = ?
+                     WHERE id = ? AND task_id IS NULL',
+                    [
+                        $id, $project, $absorbed['closed_by_gumshoe_at'], $absorbed['reopened_by_person_at'],
+                        $finding['last_synced_at'] ?? $absorbed['last_synced_at'],
+                        $finding['observed_priority'] ?? $absorbed['observed_priority'],
+                        $finding['observed_malware'] ?? $absorbed['observed_malware'],
+                        $finding['observed_kev'] ?? $absorbed['observed_kev'],
+                        $finding['observed_status'] ?? $absorbed['observed_status'], $finding['id'],
+                    ],
+                );
+                $this->check($claim->rowCount() === 1, 'claim absorbed task');
+
+                $affected = count(array_filter($this->repos((int) $finding['id']), static fn (array $repo): bool => $repo['state'] === 'affected'));
+                if ($affected === 0 && preg_match('/\(([1-9][0-9]*) repos?\)$/D', $task['title'], $match)) {
+                    $affected = (int) $match[1];
+                }
+                $title = TaskText::title($finding['package'], $finding['primary_id'], max(1, $affected));
+                $this->check($this->taskModificationModel->update([
+                    'id' => $id, 'reference' => $reference, 'title' => $title,
+                ]), 'adopt absorbed task');
+                $this->sql('UPDATE gumshoe_findings SET task_id = NULL WHERE id = ?', [$absorbed['id']]);
+
+                $updated = $this->sql('SELECT * FROM gumshoe_findings WHERE id = ?', [$finding['id']])->fetch(PDO::FETCH_ASSOC);
+
+                return [
+                    'finding' => $updated + $finding,
+                    'task' => ['reference' => $reference, 'title' => $title] + $task,
+                ];
+            });
+        }
+
+        return [];
+    }
+
     private function syncMerged(array $finding, int $targetProject, int $runId): ?string
     {
         $task = $this->findTask($finding);
         if ($task !== [] && $this->privateProject((int) $task['project_id']) === []) {
-            return $this->unavailable($runId);
+            return $this->unavailable($runId, (int) $task['project_id']);
         }
         $group = (int) $finding['merged_into'];
         $seen = [(int) $finding['group_id'] => true];
@@ -406,18 +478,20 @@ final class BoardSync extends Base
         $this->check($survivor > 0, 'find merge survivor');
 
         $problem = $this->sync($survivor, $targetProject, $runId);
-        if ($problem !== null || $task === []) {
+        if ($problem !== null) {
             return $problem;
         }
 
+        // Sync may have transferred ownership to the survivor.
+        $task = $this->findTask($finding);
         $survivorTask = (int) $this->sql('SELECT task_id FROM gumshoe_findings WHERE id = ?', [$survivor])->fetchColumn();
-        if ($survivorTask === 0) {
+        if ($task === [] || $survivorTask === 0) {
             return null;
         }
 
         $result = (new FindingModel($this->db->getConnection()))->transaction(function () use ($task, $targetProject, $survivorTask, $finding): array {
             if (!$this->lockPrivateProjects($targetProject, (int) $task['project_id'])) {
-                return ['unavailable' => true];
+                return ['unavailable' => (int) $task['project_id']];
             }
             if (!$this->lockTask($task)) {
                 return [];
@@ -430,12 +504,13 @@ final class BoardSync extends Base
                 $this->check($this->taskStatusModel->close($id), 'close merged task');
                 $closeTime = (int) $this->taskFinderModel->getById($id)['date_completed'];
             }
-            $this->persist((int) $finding['id'], $id, (int) $task['project_id'], 'merged', $finding['priority'], $closeTime);
+            $this->sql('UPDATE gumshoe_findings SET task_id = ?, project_id = ?, closed_by_gumshoe_at = ? WHERE id = ?',
+                [$id, $task['project_id'], $closeTime, $finding['id']]);
 
             return [];
         });
 
-        return isset($result['unavailable']) ? $this->unavailable($runId) : null;
+        return isset($result['unavailable']) ? $this->unavailable($runId, $targetProject, $result['unavailable']) : null;
     }
 
     private function privateProject(int $projectId): array
@@ -455,7 +530,7 @@ final class BoardSync extends Base
                 // visibility, so it cannot change before core writes.
                 $this->sql('UPDATE projects SET is_public = is_public WHERE id = ?', [$id]);
             }
-            if ($this->sql('SELECT id FROM projects WHERE id = ? AND is_public = 0'.$this->forUpdate(), [$id])->fetchColumn() === false) {
+            if ($this->sql('SELECT id FROM projects WHERE id = ? AND is_public = ?'.$this->forUpdate(), [$id, 0])->fetchColumn() === false) {
                 return false;
             }
         }
@@ -465,8 +540,7 @@ final class BoardSync extends Base
 
     private function lockTask(array $task): bool
     {
-        $params = [$task['id'], $task['project_id'], $task['is_active']];
-        $params[] = $task['reference'];
+        $params = [$task['id'], $task['project_id'], (int) $task['is_active'], $task['reference']];
         $where = 'id = ? AND project_id = ? AND is_active = ? AND reference = ? AND date_completed';
         if ($task['date_completed'] === null) {
             $where .= ' IS NULL';
@@ -492,52 +566,39 @@ final class BoardSync extends Base
         return $this->db->getConnection()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'sqlite' ? '' : ' FOR UPDATE';
     }
 
-    private function persist(int $id, ?int $task, int $project, string $status, string $priority, ?int $closed): void
-    {
+    private function persist(
+        array $finding,
+        ?int $task,
+        int $project,
+        string $status,
+        string $priority,
+        ?int $closed,
+        ?int $personReopened,
+    ): void {
         $this->sql(
-            'UPDATE gumshoe_findings SET task_id = ?, project_id = ?, status = ?, priority = ?, closed_by_gumshoe_at = ?, last_synced_at = ?
+            'UPDATE gumshoe_findings SET task_id = ?, project_id = ?, status = ?, priority = ?, closed_by_gumshoe_at = ?,
+             reopened_by_person_at = ?, last_synced_at = ?, observed_priority = ?, observed_malware = ?, observed_kev = ?, observed_status = ?
              WHERE id = ?',
-            [$task, $project ?: null, $status, $priority, $closed, time(), $id],
+            [
+                $task, $project ?: null, $status, $priority, $closed, $personReopened, time(),
+                $priority, (int) $finding['malware'], (int) $finding['kev'], $status, $finding['id'],
+            ],
         );
     }
 
-    private function snapshot(array $finding): array
-    {
-        // Board metadata holds the last observed flag bits, so they survive
-        // task deletion. The finding row remains the identity and task mapping.
-        $value = $this->sql('SELECT value FROM project_has_metadata WHERE project_id = ? AND name = ?',
-            [$finding['project_id'], 'gumshoe:observed:'.$finding['id']])->fetchColumn();
-
-        $snapshot = $value === false ? null : json_decode($value, true);
-
-        return is_array($snapshot) ? $snapshot : [];
-    }
-
-    private function saveSnapshot(int $project, array $finding, string $status): void
-    {
-        if ($project !== 0 && $this->privateProject($project) !== []) {
-            $this->writeSnapshot($project, (int) $finding['id'], [
-                'status' => $status, 'malware' => (bool) $finding['malware'], 'kev' => (bool) $finding['kev'],
-            ]);
-        }
-    }
-
-    private function writeSnapshot(int $project, int $findingId, array $snapshot): void
-    {
-        // MetadataModel::save() commits any open transaction, including ours.
-        $mysql = $this->db->getConnection()->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql';
-        $upsert = $mysql ? 'ON DUPLICATE KEY UPDATE value = VALUES(value)'
-            : 'ON CONFLICT (project_id, name) DO UPDATE SET value = excluded.value';
-        $this->sql('INSERT INTO project_has_metadata (project_id, name, value) VALUES (?, ?, ?) '.$upsert,
-            [$project, 'gumshoe:observed:'.$findingId, json_encode($snapshot, JSON_THROW_ON_ERROR)]);
-    }
-
-    private function unavailable(int $runId): string
+    private function unavailable(int $runId, int ...$projects): string
     {
         $value = $this->sql('SELECT counts FROM gumshoe_runs WHERE id = ?', [$runId])->fetchColumn();
         $this->check($value !== false, 'record unavailable project for run');
         $counts = json_decode($value, true, flags: JSON_THROW_ON_ERROR);
         $counts['project_unavailable'] = ($counts['project_unavailable'] ?? 0) + 1;
+        foreach (array_unique($projects) as $project) {
+            $row = $this->projectModel->getById($project);
+            if (!empty($row['is_public'])) {
+                $counts['project_unavailable_message'] = self::PUBLIC_BOARD_MESSAGE;
+                break;
+            }
+        }
         $this->sql('UPDATE gumshoe_runs SET counts = ? WHERE id = ?', [json_encode($counts, JSON_THROW_ON_ERROR), $runId]);
 
         return 'project_unavailable';

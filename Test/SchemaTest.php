@@ -80,6 +80,8 @@ class SchemaTest extends Base
                 'id' => 1, 'group_id' => 1, 'ecosystem' => 'Packagist', 'package' => 'symfony/yaml',
                 'task_id' => 8, 'project_id' => 7, 'priority' => 'high', 'status' => 'open',
                 'closed_by_gumshoe_at' => null, 'last_synced_at' => 1700000016,
+                'reopened_by_person_at' => 1700000017, 'observed_priority' => 'high',
+                'observed_malware' => 1, 'observed_kev' => 0, 'observed_status' => 'open',
             ],
             'finding_repos' => [
                 'finding_id' => 1, 'repo_id' => 1, 'subtask_id' => 9, 'state' => 'affected', 'ever_affected' => 1,

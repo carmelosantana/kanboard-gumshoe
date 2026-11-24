@@ -17,7 +17,7 @@ final readonly class Reconciler
      * supplied to Matcher are complete. The hourly job uses positive matches only.
      *
      * @param list<array{group_id: int, ecosystem: string, package: string, repo_id: int, lockfile_id: int, version: string}> $matches
-     * @return array<int, array{from: ?string, to: string, was_ever_affected: bool, comment: ?string}
+     * @return array<int, array{from: ?string, to: string, was_ever_affected: bool, comment: ?string, outcome?: string}
      *     |array{from: string, to: 'merged', survivor_finding_id: int}>
      *     Transitions keyed by finding ID for the board sync.
      */
@@ -50,7 +50,7 @@ final readonly class Reconciler
                     }
                 }
 
-                return $merges + $this->applyStates($repoId, $previous, $states, $comment);
+                return $merges + $this->applyStates($repoId, $previous, $states, $comment, $outcome);
             }
 
             $seen = [];
@@ -105,7 +105,7 @@ final readonly class Reconciler
         return array_keys(array_diff_key($retired, $stillActive));
     }
 
-    private function applyStates(int $repoId, array $previous, array $states, ?string $comment = null): array
+    private function applyStates(int $repoId, array $previous, array $states, ?string $comment = null, ?string $outcome = null): array
     {
         $transitions = [];
         foreach ($states as $findingId => $state) {
@@ -122,6 +122,9 @@ final readonly class Reconciler
                 'was_ever_affected' => !empty($row['ever_affected']),
                 'comment' => $comment,
             ];
+            if ($outcome !== null) {
+                $transitions[$findingId]['outcome'] = $outcome;
+            }
         }
 
         return $transitions;
