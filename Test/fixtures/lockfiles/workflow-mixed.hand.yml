@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: github/codeql-action/init@v4
+      - uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: -color
+      - uses: ./.github/actions/local-setup
+      - run: npm ci && npm test
+
+  provenance:
+    needs: [test]
+    permissions:
+      actions: read
+      id-token: write
+      contents: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0
+    with:
+      base64-subjects: "${{ needs.test.outputs.hashes }}"

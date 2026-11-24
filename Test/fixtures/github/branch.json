@@ -1,0 +1,103 @@
+{
+  "name": "main",
+  "commit": {
+    "sha": "0bfcd66ff5f7f4ad638bf091a67f963b67ebb1d7",
+    "node_id": "C_kwDOMsf7NtoAKDBiZmNkNjZmZjVmN2Y0YWQ2MzhiZjA5MWE2N2Y5NjNiNjdlYmIxZDc",
+    "commit": {
+      "author": {
+        "name": "Carmelo Santana",
+        "email": "me@carmelosantana.com",
+        "date": "2024-09-28T21:42:38Z"
+      },
+      "committer": {
+        "name": "Carmelo Santana",
+        "email": "me@carmelosantana.com",
+        "date": "2024-09-28T21:42:38Z"
+      },
+      "message": "Add support for TypeScript files",
+      "tree": {
+        "sha": "e705c2485ff336065ac514f02bdc9ad06d8b8690",
+        "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/trees/e705c2485ff336065ac514f02bdc9ad06d8b8690"
+      },
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/commits/0bfcd66ff5f7f4ad638bf091a67f963b67ebb1d7",
+      "comment_count": 0,
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "signature": null,
+        "payload": null,
+        "verified_at": null
+      }
+    },
+    "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/commits/0bfcd66ff5f7f4ad638bf091a67f963b67ebb1d7",
+    "html_url": "https://github.com/carmelosantana/ai-context-builder/commit/0bfcd66ff5f7f4ad638bf091a67f963b67ebb1d7",
+    "comments_url": "https://api.github.com/repos/carmelosantana/ai-context-builder/commits/0bfcd66ff5f7f4ad638bf091a67f963b67ebb1d7/comments",
+    "author": {
+      "login": "carmelosantana",
+      "id": 597820,
+      "node_id": "MDQ6VXNlcjU5NzgyMA==",
+      "avatar_url": "https://avatars.githubusercontent.com/u/597820?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/carmelosantana",
+      "html_url": "https://github.com/carmelosantana",
+      "followers_url": "https://api.github.com/users/carmelosantana/followers",
+      "following_url": "https://api.github.com/users/carmelosantana/following{/other_user}",
+      "gists_url": "https://api.github.com/users/carmelosantana/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/carmelosantana/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/carmelosantana/subscriptions",
+      "organizations_url": "https://api.github.com/users/carmelosantana/orgs",
+      "repos_url": "https://api.github.com/users/carmelosantana/repos",
+      "events_url": "https://api.github.com/users/carmelosantana/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/carmelosantana/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "committer": {
+      "login": "carmelosantana",
+      "id": 597820,
+      "node_id": "MDQ6VXNlcjU5NzgyMA==",
+      "avatar_url": "https://avatars.githubusercontent.com/u/597820?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/carmelosantana",
+      "html_url": "https://github.com/carmelosantana",
+      "followers_url": "https://api.github.com/users/carmelosantana/followers",
+      "following_url": "https://api.github.com/users/carmelosantana/following{/other_user}",
+      "gists_url": "https://api.github.com/users/carmelosantana/gists{/gist_id}",
+      "starred_url": "https://api.github.com/users/carmelosantana/starred{/owner}{/repo}",
+      "subscriptions_url": "https://api.github.com/users/carmelosantana/subscriptions",
+      "organizations_url": "https://api.github.com/users/carmelosantana/orgs",
+      "repos_url": "https://api.github.com/users/carmelosantana/repos",
+      "events_url": "https://api.github.com/users/carmelosantana/events{/privacy}",
+      "received_events_url": "https://api.github.com/users/carmelosantana/received_events",
+      "type": "User",
+      "user_view_type": "public",
+      "site_admin": false
+    },
+    "parents": [
+      {
+        "sha": "82c8473175bf5ce9198887872598f71c0da266f1",
+        "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/commits/82c8473175bf5ce9198887872598f71c0da266f1",
+        "html_url": "https://github.com/carmelosantana/ai-context-builder/commit/82c8473175bf5ce9198887872598f71c0da266f1"
+      }
+    ]
+  },
+  "_links": {
+    "self": "https://api.github.com/repos/carmelosantana/ai-context-builder/branches/main",
+    "html": "https://github.com/carmelosantana/ai-context-builder/tree/main"
+  },
+  "protected": false,
+  "protection": {
+    "enabled": false,
+    "required_status_checks": {
+      "enforcement_level": "off",
+      "contexts": [
+
+      ],
+      "checks": [
+
+      ]
+    }
+  },
+  "protection_url": "https://api.github.com/repos/carmelosantana/ai-context-builder/branches/main/protection"
+}

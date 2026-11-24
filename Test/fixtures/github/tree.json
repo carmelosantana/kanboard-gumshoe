@@ -1,0 +1,77 @@
+{
+  "sha": "e705c2485ff336065ac514f02bdc9ad06d8b8690",
+  "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/trees/e705c2485ff336065ac514f02bdc9ad06d8b8690",
+  "tree": [
+    {
+      "path": ".gitattributes",
+      "mode": "100755",
+      "type": "blob",
+      "sha": "dfe0770424b2a19faf507a501ebfc23be8f54e7b",
+      "size": 66,
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/blobs/dfe0770424b2a19faf507a501ebfc23be8f54e7b"
+    },
+    {
+      "path": ".gitignore",
+      "mode": "100755",
+      "type": "blob",
+      "sha": "abad970d31163960097cbdb957087acd14d5b832",
+      "size": 65,
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/blobs/abad970d31163960097cbdb957087acd14d5b832"
+    },
+    {
+      "path": "LICENSE.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "ca6b11ea8a28532b106b35286da23736bc5dc3f1",
+      "size": 1083,
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/blobs/ca6b11ea8a28532b106b35286da23736bc5dc3f1"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "ea8b4354973cbd4377bfd56478dcd65c8d1d588a",
+      "size": 2949,
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/blobs/ea8b4354973cbd4377bfd56478dcd65c8d1d588a"
+    },
+    {
+      "path": "composer.json",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "967a026414ede63037a7626a8a5b7d89a1622626",
+      "size": 965,
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/blobs/967a026414ede63037a7626a8a5b7d89a1622626"
+    },
+    {
+      "path": "src",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "953463e7fdc41766bd8dccec876da14ed429b0b5",
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/trees/953463e7fdc41766bd8dccec876da14ed429b0b5"
+    },
+    {
+      "path": "src/ContextBuilder.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "229c496997ddfc4121b27ce86e490c364974583d",
+      "size": 9926,
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/blobs/229c496997ddfc4121b27ce86e490c364974583d"
+    },
+    {
+      "path": "tests",
+      "mode": "040000",
+      "type": "tree",
+      "sha": "647113f798853c412a1298b65d8065d52e0347af",
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/trees/647113f798853c412a1298b65d8065d52e0347af"
+    },
+    {
+      "path": "tests/ContextBuilderTest.php",
+      "mode": "100644",
+      "type": "blob",
+      "sha": "715513bbb9dcef3ead5167acf0f324a55f988cee",
+      "size": 4100,
+      "url": "https://api.github.com/repos/carmelosantana/ai-context-builder/git/blobs/715513bbb9dcef3ead5167acf0f324a55f988cee"
+    }
+  ],
+  "truncated": false
+}

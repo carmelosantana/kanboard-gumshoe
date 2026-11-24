@@ -1,0 +1,19 @@
+{
+  "name": "hostile-example",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "hostile-example",
+      "version": "1.0.0",
+      "dependencies": {
+        "fake-ghp_A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1-github_pat_A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1": "1.0.0"
+      }
+    },
+    "node_modules/fake-ghp_A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1-github_pat_A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1A1": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+    }
+  }
+}
