@@ -17,9 +17,9 @@ require_once 'tests/units/Base.php';
 
 /**
  * Where the Vault checkout the autoloader serves lives, and whether it carries the consumer API.
- * The consumer API is on Vault's feat/server-reader branch until it is released; the normal harness has Vault on
- * main, so this suite skips there. GUMSHOE_REQUIRE_VAULT=1 (the dedicated isolated run) turns every skip into a
- * failure and also requires the checkout to be on feat/server-reader.
+ * The consumer API came from Vault's feat/server-reader branch (merged into main for v1.1.0); a checkout without it
+ * skips. GUMSHOE_REQUIRE_VAULT=1 turns every skip into a failure and also requires the checkout's HEAD to contain
+ * feat/server-reader's commit.
  */
 final class VaultCheckout
 {
@@ -57,14 +57,33 @@ final class VaultCheckout
         return getenv('GUMSHOE_REQUIRE_VAULT') === '1';
     }
 
+    /**
+     * The checkout's HEAD contains feat/server-reader's commit (main after the v1.1.0 merge, or the branch itself).
+     * Without that ref in the repo, only a checkout on the branch itself qualifies.
+     */
+    public static function containsConsumerBranch(): bool
+    {
+        $dir = self::dir();
+        if ($dir === null) {
+            return false;
+        }
+        $git = 'git -C '.escapeshellarg($dir).' ';
+        exec($git.'rev-parse --verify --quiet '.escapeshellarg(self::BRANCH.'^{commit}').' 2>/dev/null', $out, $missing);
+        if ($missing !== 0) {
+            return self::branch() === self::BRANCH;
+        }
+        exec($git.'merge-base --is-ancestor '.escapeshellarg(self::BRANCH).' HEAD 2>/dev/null', $out, $notAncestor);
+        return $notAncestor === 0;
+    }
+
     /** Why this run cannot exercise the real consumer API, or null when it can. */
     public static function problem(): ?string
     {
         if (!self::hasConsumerApi()) {
             return 'Vault consumer API (Secrets\ServiceSecrets, Model\ServerSecrets) is absent from '.(self::dir() ?? 'plugins/Vault');
         }
-        if (self::required() && self::branch() !== self::BRANCH) {
-            return 'Vault checkout is on "'.self::branch().'", not '.self::BRANCH;
+        if (self::required() && !self::containsConsumerBranch()) {
+            return 'Vault checkout ("'.self::branch().'") does not contain '.self::BRANCH;
         }
         return null;
     }
