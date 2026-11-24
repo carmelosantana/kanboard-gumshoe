@@ -2,7 +2,6 @@
 
 namespace Kanboard\Plugin\Gumshoe\Inventory;
 
-use Generator;
 use UnexpectedValueException;
 
 final class PnpmLock
@@ -34,12 +33,15 @@ final class PnpmLock
         $deps = [];
         try {
             foreach ($documents as $index => $document) {
-                foreach (self::rows($document, $majors[$index]) as $dependency) {
-                    if (!$limits->allowsDependencies(count($deps) + 1)) {
-                        return new ParseResult([], 'too_many');
-                    }
+                $remaining = Limits::MAX_REPO_DEPS - $limits->repoRows - count($deps);
+                $rows = self::rows($document, $majors[$index], $remaining);
+                if ($rows === null) {
+                    return new ParseResult([], 'too_many');
+                }
+                foreach ($rows as $dependency) {
                     $deps[] = $dependency;
                 }
+                unset($rows);
             }
         } catch (UnexpectedValueException) {
             return new ParseResult([], 'parse_error');
@@ -48,8 +50,8 @@ final class PnpmLock
         return new ParseResult($deps);
     }
 
-    /** @return Generator<Dependency> */
-    private static function rows(array $document, int $major): Generator
+    /** @return array<string, Dependency>|null Null if the unique rows exceed the budget. */
+    private static function rows(array $document, int $major, int $remaining): ?array
     {
         $packages = self::map($document, 'packages');
         $settings = self::map($document, 'settings');
@@ -63,13 +65,18 @@ final class PnpmLock
             }
 
             $id = self::packageId($key, $major);
+            if ($id === null && $major !== 6) {
+                throw new UnexpectedValueException();
+            }
+            $base = $id === null ? 'opaque:'.$key : explode('(', $id, 2)[0];
+            if (!isset($rows[$base]) && count($rows) >= $remaining) {
+                return null;
+            }
+
             $resolution = self::map($package, 'resolution');
             $scope = $major === 6 && ($package['dev'] ?? false) === true ? 'dev' : 'prod';
             if ($id === null) {
-                if ($major !== 6) {
-                    throw new UnexpectedValueException();
-                }
-                $rows['opaque:'.$key] = new Dependency(
+                $rows[$base] = new Dependency(
                     'npm',
                     is_string($package['name'] ?? null) ? $package['name'] : $key,
                     is_string($package['version'] ?? null) ? $package['version'] : null,
@@ -80,14 +87,13 @@ final class PnpmLock
                 );
                 continue;
             }
-            $base = explode('(', $id, 2)[0];
             $separator = strpos($base, '@', 1);
             $name = substr($base, 0, $separator);
             $version = substr($base, $separator + 1);
             $queryable = preg_match('/\A'.self::REGISTRY_VERSION.'\z/', $version) === 1;
             $hasTarball = array_key_exists('tarball', $resolution);
             $public = $queryable && ($hasTarball
-                ? self::isNpmRegistry($resolution['tarball'])
+                ? $resolution['tarball'] === 'https://registry.npmjs.org/'.$name.'/-/'.basename($name).'-'.$version.'.tgz'
                 : $defaultRegistry && !isset($resolution['type']));
             $inferred = !$hasTarball;
             $scope = $scopes[$base] ?? $scope;
@@ -109,7 +115,7 @@ final class PnpmLock
             );
         }
 
-        yield from $rows;
+        return $rows;
     }
 
     private static function packageId(string $key, int $major): ?string

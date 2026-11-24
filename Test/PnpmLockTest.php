@@ -91,6 +91,55 @@ final class PnpmLockTest extends TestCase
         self::assertSame([], $result->deps);
     }
 
+    public function testStopsBuildingRowsWhenTheRemainingBudgetIsExceeded(): void
+    {
+        $contents = <<<'YAML'
+            lockfileVersion: '6.0'
+            packages:
+              /is-number@6.0.0: {}
+              /is-number@6.0.0(is-odd@3.0.1): {dev: true}
+              /is-odd@3.0.1: {}
+            YAML;
+        $limits = new Limits(Limits::MAX_REPO_DEPS - 1);
+        $fits = PnpmLock::parse(substr($contents, 0, strrpos($contents, "\n")), $limits);
+        self::assertSame('ok', $fits->status);
+        self::assertSame(['is-number'], array_column($fits->deps, 'name'));
+
+        $result = PnpmLock::parse($contents."\n  /is-positive@3.1.0: invalid", $limits);
+        self::assertSame('too_many', $result->status);
+        self::assertSame([], $result->deps);
+    }
+
+    public function testDenseLockfileIsRejectedUnderTheScanMemoryLimit(): void
+    {
+        $script = <<<'PHP'
+            $loader = require $argv[1].'/vendor/autoload.php';
+            $loader->addPsr4('Kanboard\\Plugin\\Gumshoe\\', $argv[1]);
+            $contents = "lockfileVersion: '9.0'\npackages:\n";
+            for ($i = 0; $i < 180_000; ++$i) {
+                $contents .= "  test-package-$i@1.0.0: {}\n";
+            }
+            if (strlen($contents) >= \Kanboard\Plugin\Gumshoe\Inventory\Limits::MAX_FILE_BYTES) {
+                exit(2);
+            }
+            $result = \Kanboard\Plugin\Gumshoe\Inventory\PnpmLock::parse(
+                $contents,
+                new \Kanboard\Plugin\Gumshoe\Inventory\Limits(),
+            );
+            echo $result->status, ':', count($result->deps);
+            PHP;
+        $process = proc_open(
+            [PHP_BINARY, '-d', 'memory_limit=128M', '-r', $script, dirname(__DIR__)],
+            [1 => ['pipe', 'w'], 2 => ['redirect', 1]],
+            $pipes,
+        );
+        self::assertIsResource($process);
+        $output = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        self::assertSame(0, proc_close($process), $output);
+        self::assertContains($output, ['too_many:0', 'parse_error:0']);
+    }
+
     public function testV6NonRegistryKeysUseDeclaredOrOpaqueIdentities(): void
     {
         $sha = str_repeat('a', 40);
@@ -139,6 +188,27 @@ final class PnpmLockTest extends TestCase
             self::assertSame('ok', $result->status);
             self::assertSame([null, null, 'npmjs'], array_column($result->deps, 'registry_evidence'));
             self::assertSame([false, false, false], array_column($result->deps, 'evidence_inferred'));
+        }
+    }
+
+    public function testExplicitRegistryEvidenceRequiresTheRowsExactTarball(): void
+    {
+        $result = PnpmLock::parse(<<<'YAML'
+            lockfileVersion: '9.0'
+            packages:
+              is-odd@3.0.1: {resolution: {tarball: 'https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz'}}
+              is-number@5.0.0: {resolution: {tarball: 'https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz'}}
+              is-number@6.0.0: {resolution: {tarball: 'http://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz'}}
+              '@actions/core@1.6.0': {resolution: {tarball: 'https://registry.npmjs.org/@actions/core/-/core-1.6.0.tgz'}}
+            YAML, new Limits());
+        self::assertSame('ok', $result->status);
+        self::assertSame([null, null, null, 'npmjs'], array_column($result->deps, 'registry_evidence'));
+
+        $fixture = PnpmLock::parse($this->fixture('pnpm-lock.v9-workspace.yaml'), new Limits());
+        self::assertSame('ok', $fixture->status);
+        self::assertNotEmpty($fixture->deps);
+        foreach ($fixture->deps as $dependency) {
+            self::assertSame('npmjs', $dependency->registry_evidence, $dependency->name);
         }
     }
 
