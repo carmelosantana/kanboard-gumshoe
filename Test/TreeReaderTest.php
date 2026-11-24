@@ -140,6 +140,73 @@ final class TreeReaderTest extends TestCase
         }
     }
 
+    public function testRegistryParserRejectsAnEightMiBBodyUnderTheScanMemoryLimit(): void
+    {
+        $script = <<<'PHP'
+            $loader = require $argv[1].'/vendor/autoload.php';
+            $loader->addPsr4('Kanboard\\Plugin\\Gumshoe\\', $argv[1]);
+            $parse = new ReflectionMethod(Kanboard\Plugin\Gumshoe\GitHub\TreeReader::class, 'registryHosts');
+            $hosts = $parse->invoke(null, str_repeat("\n", 8 * 1024 * 1024));
+            echo $hosts === null ? 'unknown' : 'known';
+            PHP;
+        $process = proc_open(
+            [PHP_BINARY, '-d', 'memory_limit=128M', '-r', $script, dirname(__DIR__)],
+            [1 => ['pipe', 'w'], 2 => ['redirect', 1]],
+            $pipes,
+        );
+        self::assertIsResource($process);
+        $output = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        self::assertSame(0, proc_close($process), $output);
+        self::assertSame('unknown', $output);
+    }
+
+    public function testOversizeRegistryConfigIsSkippedBeforeFetchingAndTheNextRepoIsProcessed(): void
+    {
+        $lock = $this->entry('package-lock.json', 1);
+        $config = array_replace($this->entry('.npmrc', 2), ['size' => 64 * 1024 + 1]);
+        $npm = new Response(200, [], '{"lockfileVersion":3,"packages":{}}');
+        [$reader, $transport] = $this->reader([
+            $this->branch(), $this->tree([$lock, $config]), $npm,
+            $this->branch(), $this->tree([$lock]), $npm,
+        ]);
+
+        $first = $reader->read(self::OWNER, self::REPO);
+        $second = $reader->read(self::OWNER, ['name' => 'console', 'default_branch' => 'main']);
+        self::assertSame('partial', $first['outcome']);
+        self::assertSame('unknown', $first['files'][0]['registryConfig']);
+        self::assertSame('complete', $second['outcome']);
+        self::assertSame([], $second['files'][0]['registryConfig']);
+        self::assertCount(6, $transport->requests);
+        self::assertNotContains(self::BASE.'/git/blobs/'.$config['sha'], array_column($transport->requests, 'url'));
+    }
+
+    public function testRegistryConfigEnforcesBodyAndLineLimits(): void
+    {
+        $registry = 'registry=https://registry.npmjs.org/';
+        $atByteLimit = $registry.str_repeat("\n".str_repeat(' ', 4095), 15);
+        $atByteLimit .= "\n".str_repeat(' ', 64 * 1024 - strlen($atByteLimit) - 1);
+        $known = ['registry' => 'registry.npmjs.org'];
+        $cases = [
+            [$atByteLimit, $known],
+            [$atByteLimit.' ', 'unknown'],
+            [str_repeat("\r\n", 1999).$registry."\r\n", $known],
+            [str_repeat("\r\n", 2000).$registry, 'unknown'],
+            [$registry."\r".str_repeat('#', 4096), $known],
+            [$registry."\r".str_repeat('#', 4097), 'unknown'],
+            ["\xef\xbb\xbf".$registry."\rignored=value\r".'@npmcli:registry=https://example.org/', $known + ['@npmcli' => 'example.org']],
+        ];
+        foreach ($cases as [$body, $expected]) {
+            [$reader] = $this->reader([
+                $this->branch(), $this->tree([$this->entry('package-lock.json', 1), $this->entry('.npmrc', 2)]),
+                new Response(200, [], '{"lockfileVersion":3,"packages":{}}'),
+                new Response(200, [], $body),
+            ]);
+            $scan = $reader->read(self::OWNER, self::REPO);
+            self::assertSame($expected, $scan['files'][0]['registryConfig']);
+        }
+    }
+
     public function testOversizeBlobsReportPartialBeforeFetchAndAfterDecode(): void
     {
         $entries = [

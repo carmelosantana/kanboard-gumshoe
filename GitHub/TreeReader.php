@@ -27,6 +27,9 @@ final class TreeReader
         'package-lock.json' => 'npm',
         'pnpm-lock.yaml' => 'pnpm',
     ];
+    private const MAX_NPMRC_BYTES = 64 * 1024;
+    private const MAX_NPMRC_LINES = 2_000;
+    private const MAX_NPMRC_LINE_BYTES = 4 * 1024;
 
     public function __construct(private readonly Client $client)
     {
@@ -258,7 +261,9 @@ final class TreeReader
                         if ($usedRequest) {
                             return null;
                         }
-                        [$body, , $scan['retryAt']] = $this->blob($base, $login, $state['configs'][$candidate], $jobRef);
+                        [$body, , $scan['retryAt']] = $this->blob(
+                            $base, $login, $state['configs'][$candidate], $jobRef, self::MAX_NPMRC_BYTES,
+                        );
                         $state['registryCache'][$candidate] = $body === null ? null : self::registryHosts($body);
                         $usedRequest = true;
                     }
@@ -299,12 +304,17 @@ final class TreeReader
     }
 
     /** @return array{?string, string, ?int} */
-    private function blob(#[\SensitiveParameter] string $base, string $login, array $entry, ?string $jobRef): array
-    {
+    private function blob(
+        #[\SensitiveParameter] string $base,
+        string $login,
+        array $entry,
+        ?string $jobRef,
+        int $maxBytes = Limits::MAX_FILE_BYTES,
+    ): array {
         if ($entry['type'] !== 'blob' || !in_array($entry['mode'], ['100644', '100755'], true)) {
             return [null, 'unsupported', null];
         }
-        if (is_int($entry['size']) && $entry['size'] > Limits::MAX_FILE_BYTES) {
+        if (is_int($entry['size']) && $entry['size'] > $maxBytes) {
             return [null, 'too_large', null];
         }
 
@@ -321,7 +331,7 @@ final class TreeReader
         if ($response->status !== 200) {
             return [null, 'stale', $response->retryAt];
         }
-        if (strlen($response->body) > Limits::MAX_FILE_BYTES) {
+        if (strlen($response->body) > $maxBytes) {
             return [null, 'too_large', $response->retryAt];
         }
         return [$response->body, 'ok', $response->retryAt];
@@ -329,9 +339,28 @@ final class TreeReader
 
     private static function registryHosts(#[\SensitiveParameter] string $contents): ?array
     {
-        $contents = str_starts_with($contents, "\xef\xbb\xbf") ? substr($contents, 3) : $contents;
+        $length = strlen($contents);
+        if ($length > self::MAX_NPMRC_BYTES) {
+            return null;
+        }
+
+        $offset = str_starts_with($contents, "\xef\xbb\xbf") ? 3 : 0;
         $hosts = [];
-        foreach (preg_split('/\r\n|\r|\n/', $contents) as $line) {
+        for ($lines = 0; $offset < $length; ++$lines) {
+            if ($lines >= self::MAX_NPMRC_LINES) {
+                return null;
+            }
+            $lineLength = strcspn($contents, "\r\n", $offset, self::MAX_NPMRC_LINE_BYTES + 1);
+            if ($lineLength > self::MAX_NPMRC_LINE_BYTES) {
+                return null;
+            }
+            $line = substr($contents, $offset, $lineLength);
+            $offset += $lineLength;
+            if (($contents[$offset] ?? null) === "\r" && ($contents[$offset + 1] ?? null) === "\n") {
+                ++$offset;
+            }
+            ++$offset;
+
             if (!preg_match('/\A\s*((@[a-z0-9_.-]+):registry|registry)\s*(?==|\[|$)(.*)\z/i', $line, $assignment)) {
                 continue;
             }
