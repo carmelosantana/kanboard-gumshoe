@@ -2,8 +2,6 @@
 
 namespace Kanboard\Plugin\Gumshoe\Inventory;
 
-use stdClass;
-
 final class ComposerLock
 {
     public static function parse(string $contents, Limits $limits): ParseResult
@@ -14,12 +12,12 @@ final class ComposerLock
         }
 
         $groups = [
-            'prod' => $lock->packages ?? null,
-            'dev' => $lock->{'packages-dev'} ?? [],
+            'prod' => $lock['packages'] ?? null,
+            'dev' => $lock['packages-dev'] ?? [],
         ];
         $deps = [];
         foreach ($groups as $scope => $packages) {
-            if (!is_array($packages)) {
+            if (!is_array($packages) || !array_is_list($packages)) {
                 return new ParseResult([], 'parse_error');
             }
             if (!$limits->allowsDependencies(count($deps) + count($packages))) {
@@ -27,25 +25,25 @@ final class ComposerLock
             }
 
             foreach ($packages as $package) {
-                if (!$package instanceof stdClass || !is_string($package->name ?? null)
-                    || !is_string($package->version ?? null)) {
+                if (!is_array($package) || !is_string($package['name'] ?? null)
+                    || !is_string($package['version'] ?? null)) {
                     return new ParseResult([], 'parse_error');
                 }
 
-                $version = $package->version;
+                $version = $package['version'];
                 if (str_starts_with($version, 'v')) {
                     $version = substr($version, 1);
                 }
 
-                $reference = $package->source->reference ?? null;
+                $reference = $package['source']['reference'] ?? null;
                 $deps[] = new Dependency(
                     'composer',
-                    $package->name,
+                    $package['name'],
                     $version,
                     $scope,
-                    ($package->source->type ?? null) === 'git' && is_string($reference) ? $reference : null,
+                    ($package['source']['type'] ?? null) === 'git' && is_string($reference) ? $reference : null,
                     Dependency::QUERY_PACKAGE,
-                    ($package->{'notification-url'} ?? null) === 'https://packagist.org/downloads/' ? 'packagist' : null,
+                    ($package['notification-url'] ?? null) === 'https://packagist.org/downloads/' ? 'packagist' : null,
                 );
             }
         }

@@ -148,14 +148,18 @@ final class EgressPolicyTest extends TestCase
         self::assertSame($requests, $transport->requests);
     }
 
-    public function testHostileNpmNameIsUnqueryableDespiteRegistryEvidence(): void
+    public function testHostileNpmNameIsUnqueryableWithOrWithoutRegistryEvidence(): void
     {
         $result = NpmLock::parse(file_get_contents(__DIR__.'/fixtures/hostile/package-lock-script-name.json'), new Limits());
         self::assertSame('ok', $result->status);
         $dep = $result->deps[0];
         self::assertSame('</script><img src=x>', $dep->name);
-        self::assertSame('npmjs', $dep->registry_evidence);
-        self::assertSame('unqueryable', (new Policy())->verdict($dep, 'npm'));
+        self::assertNull($dep->registry_evidence);
+        $policy = new Policy();
+        self::assertSame('unqueryable', $policy->verdict($dep, 'npm'));
+
+        $withEvidence = new Dependency('npm', $dep->name, $dep->version, 'prod', null, 'package', 'npmjs');
+        self::assertSame('unqueryable', $policy->verdict($withEvidence, 'npm'));
     }
 
     public function testWorkspaceDependenciesArePrivateAndExcludedFromCoverageGaps(): void

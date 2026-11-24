@@ -109,6 +109,69 @@ final class NpmLockTest extends TestCase
         self::assertSame([], $result->deps);
     }
 
+    public function testDenseLockfileIsRejectedUnderTheScanMemoryLimit(): void
+    {
+        $script = <<<'PHP'
+            $loader = require $argv[1].'/vendor/autoload.php';
+            $loader->addPsr4('Kanboard\\Plugin\\Gumshoe\\', $argv[1]);
+            $contents = '{"lockfileVersion":3,"packages":{';
+            for ($i = 0; $i < 180_000; ++$i) {
+                $contents .= '"node_modules/dep-'.$i.'":{"version":"1"},';
+            }
+            $contents .= '"":{}}}';
+            $result = \Kanboard\Plugin\Gumshoe\Inventory\NpmLock::parse(
+                $contents,
+                new \Kanboard\Plugin\Gumshoe\Inventory\Limits(),
+            );
+            echo $result->status, ':', count($result->deps);
+            PHP;
+        $process = proc_open(
+            [PHP_BINARY, '-d', 'memory_limit=128M', '-r', $script, dirname(__DIR__)],
+            [1 => ['pipe', 'w'], 2 => ['redirect', 1]],
+            $pipes,
+        );
+        self::assertIsResource($process);
+        $output = stream_get_contents($pipes[1]);
+        fclose($pipes[1]);
+        self::assertSame(0, proc_close($process), $output);
+        self::assertSame('too_many:0', $output);
+    }
+
+    public function testRegistryEvidenceRequiresTheExactPackageTarball(): void
+    {
+        $tarball = 'https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz';
+        $result = NpmLock::parse(json_encode([
+            'lockfileVersion' => 3,
+            'packages' => [
+                'node_modules/lodash' => ['version' => '4.17.21', 'resolved' => $tarball],
+                'node_modules/clone/node_modules/lodash' => ['version' => '4.17.20', 'resolved' => $tarball],
+                'node_modules/@acme/secret-payroll' => [
+                    'version' => 'ghp_'.str_repeat('A1', 18),
+                    'resolved' => $tarball,
+                ],
+                'node_modules/@actions/core' => [
+                    'version' => '1.6.0',
+                    'resolved' => 'https://registry.npmjs.org/@actions%2fcore/-/core-1.6.0.tgz',
+                ],
+                'node_modules/once' => [
+                    'version' => '1.4.0',
+                    'resolved' => 'https://registry.npmjs.org/once/-/once-1.4.0.tgz?query=1',
+                ],
+                'node_modules/wrappy' => [
+                    'version' => '1.0.2',
+                    'resolved' => 'http://registry.npmjs.org/wrappy/-/wrappy-1.0.2.tgz',
+                ],
+            ],
+        ], JSON_THROW_ON_ERROR), new Limits());
+
+        self::assertSame('ok', $result->status);
+        self::assertSame(['npmjs', null, null, 'npmjs', null, null], array_column($result->deps, 'registry_evidence'));
+
+        $fixture = NpmLock::parse($this->fixture('lockfiles/package-lock.v2.json'), new Limits());
+        self::assertSame('ok', $fixture->status);
+        self::assertSame('npmjs', array_column($fixture->deps, 'registry_evidence', 'name')['@actions/core']);
+    }
+
     public function testPackageNameIsPreservedVerbatim(): void
     {
         $result = NpmLock::parse($this->fixture('hostile/package-lock-script-name.json'), new Limits());
@@ -126,6 +189,14 @@ final class NpmLockTest extends TestCase
         $result = NpmLock::parse('{"lockfileVersion":3,"packages":[null]}', new Limits());
         self::assertSame('parse_error', $result->status);
         self::assertSame([], $result->deps);
+
+        $result = NpmLock::parse('{"lockfileVersion":3,"packages":[]}', new Limits());
+        self::assertSame('parse_error', $result->status);
+        self::assertSame([], $result->deps);
+
+        $result = NpmLock::parse('{"lockfileVersion":1,"dependencies":{"0":{}}}', new Limits());
+        self::assertSame('ok', $result->status);
+        self::assertSame(['0'], array_column($result->deps, 'name'));
     }
 
     private function fixture(string $path): string

@@ -16,7 +16,7 @@ what Gumshoe does not defend against.
 
 | Input | Why untrusted | Handling |
 |---|---|---|
-| Lockfiles (`composer.lock`, `package-lock.json`, `pnpm-lock.yaml`) and workflow YAML | Anyone who can push to a watched repo, or a compromised dependency's tooling, can plant one | Fetched through the GitHub API only; never cloned, installed or run. Caps: 10 MiB per file (14 MiB on the wire), 50 lockfiles per repo, 200,000 dependency rows per repo, JSON depth 64. YAML goes through vendored `symfony/yaml` 7.4.23 with no object, constant or custom-tag flags, at most 500,000 nodes and 1,000 alias references. A file over a cap or failing to parse is recorded as `too_large`, `too_many` or `parse_error` and makes the repo `partial`; nothing is skipped silently |
+| Lockfiles (`composer.lock`, `package-lock.json`, `pnpm-lock.yaml`) and workflow YAML | Anyone who can push to a watched repo, or a compromised dependency's tooling, can plant one | Fetched through the GitHub API only; never cloned, installed or run. Caps: 10 MiB per file (14 MiB on the wire), 50 lockfiles per repo, 200,000 dependency rows per repo, JSON depth 64, and 60,000 JSON objects and arrays combined per file. YAML goes through vendored `symfony/yaml` 7.4.23 with no object, constant or custom-tag flags, at most 500,000 nodes and 1,000 alias references. A file over a cap or failing to parse is recorded as `too_large`, `too_many` or `parse_error` and makes the repo `partial`; nothing is skipped silently |
 | `.npmrc` beside an npm or pnpm lockfile | Same as above | Read under the same caps; only `registry=` and `@scope:registry=` hosts are kept, never auth lines |
 | GitHub API responses (repo lists, trees, blobs, pagination links) | Network input | Shape-checked; `Link` targets must stay on the same host and endpoint; repos not owned by the configured login are dropped |
 | Advisory text from OSV, GitHub advisories and CISA KEV | Third-party text that ends up in tasks | Ids are checked against a fixed grammar. Summaries are escaped as plain text inside the Markdown Gumshoe builds. Links are built only from validated ids to `nvd.nist.gov`, `github.com/advisories` and `osv.dev`. Records with unexpected fields or shapes fail the query instead of being stored half-read |
@@ -62,7 +62,8 @@ carries `User-Agent: Kanboard-Gumshoe/{version} (+{application_url})`, so each h
 | `raw.githubusercontent.com` | `kev` | GET `cisagov/kev-data` mirror of the same feed, only when CISA fails | No |
 
 **Egress verdicts (R1).** A dependency is `public` only with public-registry evidence in its lockfile (Composer
-`notification-url` on packagist.org; npm `resolved` on registry.npmjs.org; pnpm's default registry with no
+`notification-url` on packagist.org; an npm `resolved` HTTPS tarball URL on registry.npmjs.org that matches the
+package name and version; pnpm's default registry with no
 overriding `.npmrc`) or, for an Action pinned by SHA, a repo GitHub reported public in the same run. It must also
 match the ecosystem's name grammar and no admin deny prefix (`denied`). Everything else is `private`, `denied` or
 `unqueryable` and is shown as a coverage gap. Repo names go nowhere but GitHub.
@@ -72,6 +73,8 @@ match the ecosystem's name grammar and no admin deny prefix (`denied`). Everythi
 - **A compromised Kanboard server or admin account.** Whoever runs code as Kanboard can ask Vault for the token
   while Server sharing is on. Read-only PATs limit the damage.
 - **A compromised GitHub account or PAT.** Gumshoe reads what GitHub returns.
+- **A hostile writer to a watched repo.** A writer can forge a lockfile entry with a registry URL that matches
+  its name and version. R1 protects against accidental disclosures and trusts the lockfile's registry evidence.
 - **Advisory feeds that are wrong or late.** No advisory means no task. OSV, GitHub and CISA are trusted for content.
 - **Dependencies without a lockfile, `actions.lock`, Docker images, mutable Action tags.** Not scanned in v1; shown
   as coverage gaps where Gumshoe can see them.

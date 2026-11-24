@@ -46,6 +46,10 @@ final class ComposerLockTest extends TestCase
 
         self::assertSame('parse_error', $result->status);
         self::assertSame([], $result->deps);
+
+        $result = ComposerLock::parse('{"packages":{}}', new Limits());
+        self::assertSame('parse_error', $result->status);
+        self::assertSame([], $result->deps);
     }
 
     public function testRowLimitIncludesProductionAndDevelopment(): void
@@ -57,6 +61,19 @@ final class ComposerLockTest extends TestCase
 
         self::assertSame('ok', ComposerLock::parse($contents, new Limits(199_998))->status);
         $result = ComposerLock::parse($contents, new Limits(199_999));
+        self::assertSame('too_many', $result->status);
+        self::assertSame([], $result->deps);
+    }
+
+    public function testContainerLimitCountsObjectsAndArraysOutsideStrings(): void
+    {
+        $description = json_encode(str_repeat('"{[\\', 60_001), JSON_THROW_ON_ERROR);
+        $contents = '{"packages":[],"description":'.$description.',"extra":['
+            .str_repeat('{},[],', 29_998).'{}]}';
+        self::assertSame('ok', ComposerLock::parse($contents, new Limits())->status);
+
+        $contents = substr($contents, 0, -2).',[]]}';
+        $result = ComposerLock::parse($contents, new Limits());
         self::assertSame('too_many', $result->status);
         self::assertSame([], $result->deps);
     }
