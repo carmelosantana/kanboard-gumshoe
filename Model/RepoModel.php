@@ -26,7 +26,10 @@ final class RepoModel
             return;
         }
 
-        $this->pdo->beginTransaction();
+        $ownsTransaction = !$this->pdo->inTransaction();
+        if ($ownsTransaction) {
+            $this->pdo->beginTransaction();
+        }
         try {
             $owner = $this->pdo->prepare('SELECT LOWER(login) FROM gumshoe_owners WHERE id = ? AND watch_id = 1');
             $owner->execute([$ownerId]);
@@ -75,9 +78,11 @@ final class RepoModel
                 $markGone->execute([$now, $repoId]);
             }
 
-            $this->pdo->commit();
+            if ($ownsTransaction) {
+                $this->pdo->commit();
+            }
         } catch (Throwable $error) {
-            if ($this->pdo->inTransaction()) {
+            if ($ownsTransaction && $this->pdo->inTransaction()) {
                 $this->pdo->rollBack();
             }
             throw $error;

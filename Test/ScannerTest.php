@@ -120,6 +120,90 @@ final class ScannerTest extends Base
         self::assertSame('fixed', $this->findingStatus());
     }
 
+    public function testOsvCommitsEachBatchBeforeFetchingTheNext(): void
+    {
+        self::assertSame('done', $this->scanner()->tick(self::INVENTORY, 'cli')['status']);
+        $file = (int) $this->pdo->query('SELECT id FROM gumshoe_lockfiles')->fetchColumn();
+        $insert = $this->pdo->prepare("INSERT INTO gumshoe_deps
+            (lockfile_id, ecosystem, name, version, scope, query_type, egress)
+            VALUES (?, 'npm', 'lodash', ?, 'prod', 'package', 'public')");
+        for ($i = 0; $i < 2000; $i++) {
+            $insert->execute([$file, '4.17.20-build.'.$i]);
+        }
+
+        $calls = 0;
+        $scanner = $this->scanner(function (Request $request) use (&$calls): Response {
+            self::assertSame('osv.querybatch', $request->operation);
+            if (++$calls === 3) {
+                throw new RuntimeException('Interrupted before the third batch.');
+            }
+            return self::json(['results' => array_fill(0, 1000, (object) [])]);
+        });
+        self::assertSame('more', $scanner->tick(self::RECHECK, 'cli')['status']);
+        self::assertSame(3, $calls);
+        self::assertSame(2000, (int) $this->pdo->query("SELECT COUNT(*) FROM gumshoe_pending WHERE state = 'done'")->fetchColumn());
+        self::assertSame(1, (int) $this->pdo->query("SELECT COUNT(*) FROM gumshoe_pending WHERE state = 'pending'")->fetchColumn());
+
+        $recheck = (new RunLog($this->pdo))->latest(self::RECHECK);
+        $this->now = (int) $recheck['retry_at'];
+        $scanner = $this->scanner(function (Request $request): Response {
+            self::assertCount(1, json_decode($request->body, true)['queries']);
+            return self::json(['results' => [(object) []]]);
+        });
+        self::assertSame('done', $scanner->tick(self::RECHECK, 'cli')['status']);
+    }
+
+    public function testMalwarePaginationResumesAtThePersistedCursor(): void
+    {
+        $first = 'https://api.github.com/advisories?type=malware&ecosystem=npm&per_page=100';
+        $second = $first.'&after=Y3Vyc29y%3D';
+        $catalog = file_get_contents(__DIR__.'/fixtures/ghsa/malware-npm.json');
+        $file = function (Request $request) use ($first, $second, $catalog): Response {
+            if ($request->url === $first) {
+                $this->now++;
+                return new Response(200, ['Link' => "<$second>; rel=next"], $catalog);
+            }
+            return $this->respond($request);
+        };
+        self::assertSame('more', $this->scanner($file)->tick(self::INVENTORY, 'foreman', $this->now + 1)['status']);
+        self::assertSame('query', $this->latest()['phase']);
+        self::assertSame($second, $this->latest()['position']);
+
+        $this->requests = [];
+        self::assertSame('done', $this->scanner()->tick(self::INVENTORY, 'foreman')['status']);
+        self::assertSame($second, $this->requests[0]->url);
+        self::assertNotContains($first, array_column($this->requests, 'url'));
+        self::assertSame(count(json_decode($catalog, true)), (int) $this->pdo
+            ->query("SELECT COUNT(*) FROM gumshoe_advisory_cache WHERE source = 'github-malware'")->fetchColumn());
+    }
+
+    public function testInventoryResumesARepositoryWithOneRequestPerSlice(): void
+    {
+        $blobShas = array_map(static fn (int $i): string => sha1('composer-lock-'.$i), range(1, 4));
+        $response = function (Request $request) use ($blobShas): Response {
+            $this->now++;
+            return match ($request->operation) {
+                'gh.tree' => self::json(['truncated' => false, 'tree' => array_map(
+                    static fn (int $index, string $sha): array => [
+                        'path' => 'packages/'.($index + 1).'/composer.lock', 'type' => 'blob',
+                        'mode' => '100644', 'sha' => $sha, 'size' => 1024,
+                    ],
+                    array_keys($blobShas), $blobShas,
+                )]),
+                'gh.blob' => new Response(200, [], '{"packages":[]}'),
+                default => $this->respond($request),
+            };
+        };
+        foreach (['gh.list', 'gh.branch', 'gh.tree', ...array_fill(0, 4, 'gh.blob')] as $operation) {
+            $this->requests = [];
+            self::assertSame('more', $this->scanner($response)->tick(self::INVENTORY, 'foreman', $this->now + 1)['status']);
+            self::assertSame([$operation], array_column($this->requests, 'operation'));
+        }
+        self::assertSame('done', $this->scanner()->tick(self::INVENTORY, 'foreman')['status']);
+        self::assertSame('complete', $this->pdo->query('SELECT outcome FROM gumshoe_repos')->fetchColumn());
+        self::assertSame($blobShas, $this->pdo->query('SELECT blob_sha FROM gumshoe_lockfiles ORDER BY path')->fetchAll(PDO::FETCH_COLUMN));
+    }
+
     public function testTerminalRunsFreePendingRowsAndKeepOneAnswerPerIdentity(): void
     {
         self::assertSame('done', $this->scanner()->tick(self::INVENTORY, 'cli')['status']);
@@ -350,6 +434,7 @@ final class ScannerTest extends Base
     private function scanner(?\Closure $responder = null, ?\Closure $clock = null): Scanner
     {
         $send = function (Request $request) use ($responder): Response {
+            self::assertFalse($this->pdo->inTransaction(), 'Outbound '.$request->operation.' opened inside a transaction.');
             $this->requests[] = $request;
             $this->phases[] = $this->latest()['phase'];
             return ($responder ?? $this->respond(...))($request);

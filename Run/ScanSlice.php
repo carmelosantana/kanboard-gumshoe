@@ -37,7 +37,6 @@ final class ScanSlice
 
     private readonly WriterLease $lease;
     private readonly RunLog $log;
-    private readonly PDO $store;
     private readonly string $holder;
     private readonly ScanTransport $transport;
     private readonly VaultTokenSource $tokens;
@@ -47,6 +46,9 @@ final class ScanSlice
 
     private array $run;
     private ?array $osvResults = null;
+    private ?array $osvVersions = null;
+    private bool $pendingFiltered = false;
+    private bool $queryProgress = false;
     private ?array $malwareCatalog = null;
     private ?Policy $policy = null;
 
@@ -61,7 +63,6 @@ final class ScanSlice
     ) {
         $this->lease = new WriterLease($pdo, $clock);
         $this->log = new RunLog($pdo);
-        $this->store = $this->lease->storeConnection();
         $this->holder = bin2hex(random_bytes(24));
         $this->transport = new ScanTransport($transport, $clock, $deadline, $this->keepLease(...));
         $this->tokens = new VaultTokenSource($container, $this->tokenRef(...), $clock);
@@ -175,7 +176,7 @@ final class ScanSlice
 
     private function recordStall(): bool
     {
-        $unit = [$this->run['phase'], $this->position(), $this->transport->stoppedOperation];
+        $unit = [$this->run['phase'], $this->position()];
         return $this->write(function () use ($unit): bool {
             $counts = $this->log->counts($this->id());
             $prior = $counts['stalled'] ?? [];
@@ -184,9 +185,9 @@ final class ScanSlice
             }
             $highWater = $prior['requests'] ?? 0;
             $completed = $this->transport->completed;
-            // Discovery has to replay the listing from page one on each slice.
-            // Reaching only pages seen on a prior slice does not move it forward.
-            $progress = $this->run['phase'] === 'discover' ? $completed > $highWater : $completed > 0;
+            // An interrupted unit may replay requests. Only fresh results or
+            // reaching further than the previous slice count as progress.
+            $progress = $this->queryProgress || $completed > $highWater;
             $slices = $progress ? 0 : ($prior['slices'] ?? 0) + 1;
             $counts['stalled'] = ['unit' => $unit, 'requests' => max($completed, $highWater), 'slices' => $slices];
             $this->log->saveCounts($this->id(), $counts);
@@ -228,7 +229,7 @@ final class ScanSlice
                 $counts['owner_retry_at'] = max($counts['owner_retry_at'] ?? 0, $this->retryTime($retryAt));
                 $this->log->saveCounts($this->id(), $counts);
             } else {
-                (new RepoModel($this->store))->applyListing($id, $listing, ($this->clock)());
+                (new RepoModel($this->pdo))->applyListing($id, $listing, ($this->clock)());
                 $counts = $this->log->counts($this->id());
                 $counts['listed_owners'][] = $id;
                 $this->log->saveCounts($this->id(), $counts);
@@ -264,15 +265,29 @@ final class ScanSlice
         if ($rules->watched($repo, array_replace($repo, ['gone_at' => null]))) {
             $outcome = 'inaccessible';
             if ($repo['gone_at'] === null && in_array((int) $repo['owner_id'], $counts['listed_owners'] ?? [], true)) {
-                $scan = (new TreeReader($this->client))->read($repo, $repo, $this->run['job']);
+                $state = $this->log->inventoryState($this->id(), $id);
+                $slice = (new TreeReader($this->client))->readSlice($repo, $repo, $state, $this->run['job'], 1);
                 if ($this->transport->stopped) {
                     return false;
                 }
+                if ($slice['state'] !== null) {
+                    return $this->write(function () use ($id, $slice): bool {
+                        $this->log->checkpointInventory($this->id(), $id, $slice['state'], $slice['files'], ($this->clock)());
+                        $counts = $this->log->counts($this->id());
+                        unset($counts['stalled']);
+                        $this->log->saveCounts($this->id(), $counts);
+                        $this->clearUnexpected();
+                        $this->log->checkpoint($this->id(), 'inventory', $id, null, $this->run['exception_class']);
+                        return true;
+                    });
+                }
+                $scan = TreeReader::scan($slice['scan'], [...$this->log->inventoryFiles($this->id(), $id), ...$slice['files']]);
                 $outcome = $scan['outcome'];
             }
         }
 
         return $this->write(function () use ($repo, $id, $scan, $outcome, $counts): bool {
+            $this->log->clearInventory($this->id(), $id);
             if ($scan !== null) {
                 $this->saveTokenStatus($repo);
                 if ($scan['retryAt'] !== null && $outcome !== 'complete' && $outcome !== 'no_lockfile'
@@ -281,7 +296,7 @@ final class ScanSlice
                 }
                 if ($outcome !== 'inaccessible') {
                     $this->policy ??= $this->policy($counts['listed_owners']);
-                    (new InventoryStore($this->store, $this->clock))->apply($this->id(), $id, $scan, $this->policy);
+                    (new InventoryStore($this->pdo, $this->clock))->apply($this->id(), $id, $scan, $this->policy);
                 }
             }
             // InventoryStore records complete/partial from file results. A
@@ -295,65 +310,85 @@ final class ScanSlice
 
     private function query(): bool
     {
-        $osvComplete = $this->write(function (): bool {
-            $this->filterPending();
-            $position = $this->pendingPosition($this->id());
-            if ($position === null) {
-                return true;
+        if (!$this->pendingFiltered) {
+            if ($this->denyPrefixes !== []) {
+                $this->write($this->filterPending(...));
+            }
+            $this->pendingFiltered = true;
+        }
+
+        $osv = new Osv($this->client, $this->pdo, $this->clock);
+        if (($position = $this->pendingPosition($this->id())) !== null) {
+            $this->selectPosition($position);
+            $rows = $osv->dueRows($this->id());
+            if ($rows === []) {
+                return $this->write(fn () => $this->backoff(HttpFailure::class, $osv->pendingRetryAt($this->id())));
             }
 
-            $retry = (new Osv($this->client, $this->store, $this->clock))->queryPending($this->id());
-            $next = $this->pendingPosition($this->id());
+            $this->osvVersions ??= $osv->cachedVersions();
+            $batch = $osv->fetch($rows, $this->osvVersions);
             if ($this->transport->stopped) {
-                // Osv treats a stopped transport as a retryable failure. Keep
-                // completed batches and validated advisories, but clear the
-                // artificial retry on the interrupted batch.
-                $this->execute("UPDATE gumshoe_pending SET retry_at = NULL
-                    WHERE run_id = ? AND egress = 'public' AND state = 'pending'", [$this->id()]);
-                $this->advance('query', $next);
+                if ($batch['records'] !== []) {
+                    // Retain validated details, but leave the interrupted
+                    // queries pending without turning a deadline into a retry.
+                    $this->write(fn () => $osv->store(array_replace($batch, ['ids' => []])));
+                    $this->queryProgress = true;
+                }
                 return false;
             }
-            if ($retry !== null) {
-                return $this->sourceFailure($retry, $next);
-            }
-            $this->advance('query', $this->lastPendingId());
-            return $next === null;
-        });
-        if (!$osvComplete) {
-            return false;
+
+            return $this->write(function () use ($osv, $batch, $position): bool {
+                $osv->store($batch);
+                foreach ($batch['records'] as $id => $record) {
+                    $this->osvVersions[$id] = $record['modified'];
+                }
+                if ($batch['retryAt'] !== null) {
+                    return $this->sourceFailure($batch['retryAt'], $position);
+                }
+                return $this->advance('query', $this->pendingPosition($this->id()));
+            });
         }
         if ($this->run['job'] === Jobs::RECHECK) {
             return $this->write(fn () => $this->advance('match'));
         }
 
-        // Store the completed catalog before fetching the next source so a
-        // resumed slice can proceed without repeating GHSA pagination.
-        if ($this->cache->get('run-malware', (string) $this->id()) === null) {
-            try {
-                $catalog = (new GithubMalware($this->client))->fetch();
-            } catch (HttpFailure) {
-                return $this->transport->stopped ? false : $this->write(fn () => $this->sourceFailure($this->transport->retryAt));
-            }
-            if ($this->transport->stopped) {
-                return false;
-            }
-
-            return $this->write(function () use ($catalog): bool {
-                $this->cache->put('run-malware', (string) $this->id(), $catalog, null, ($this->clock)());
-                foreach ($catalog as $item) {
-                    $this->cache->put('github-malware', $item['ghsa_id'], $item, null, ($this->clock)());
-                }
-                return $this->advance('query', $this->lastPendingId());
-            });
+        $saved = $this->cache->get('run-malware', (string) $this->id())['body'] ?? null;
+        if ($saved === null || (isset($saved['seen']) && !$saved['done'])) {
+            return $this->queryMalware($saved ?? ['catalog' => [], 'seen' => []]);
         }
 
-        return $this->write(function (): bool {
-            try {
-                (new Kev($this->client, $this->cache))->refresh();
-            } catch (HttpFailure) {
-                return $this->transport->stopped ? false : $this->sourceFailure($this->transport->retryAt);
-            }
+        $kev = new Kev($this->client, $this->cache);
+        try {
+            $catalog = $kev->fetch();
+        } catch (HttpFailure) {
+            return $this->transport->stopped ? false : $this->write(fn () => $this->sourceFailure($this->transport->retryAt));
+        }
+        return $this->write(function () use ($kev, $catalog): bool {
+            $kev->store($catalog, ($this->clock)());
             return $this->advance('match');
+        });
+    }
+
+    private function queryMalware(array $saved): bool
+    {
+        $github = new GithubMalware($this->client);
+        $position = $this->position();
+        try {
+            $page = $github->fetchPage(is_string($position) ? $position : null, $saved['seen']);
+        } catch (HttpFailure) {
+            return $this->transport->stopped ? false : $this->write(fn () => $this->sourceFailure($this->transport->retryAt));
+        }
+
+        return $this->write(function () use ($github, $page, $saved): bool {
+            array_push($saved['catalog'], ...$page['items']);
+            $saved['seen'][$page['key']] = true;
+            $saved['done'] = $page['next'] === null;
+            $now = ($this->clock)();
+            $this->cache->put('run-malware', (string) $this->id(), $saved, null, $now);
+            if ($saved['done']) {
+                $github->store($saved['catalog'], $this->cache, $now);
+            }
+            return $this->advance('query', $page['next']);
         });
     }
 
@@ -376,7 +411,11 @@ final class ScanSlice
             [$runId, $id],
         );
         $this->osvResults ??= (new Osv($this->client, $this->pdo, $this->clock))->results($runId);
-        $catalog = $this->malwareCatalog ??= $inventory ? ($this->cache->get('run-malware', (string) $runId)['body'] ?? []) : [];
+        if ($this->malwareCatalog === null) {
+            $saved = $inventory ? ($this->cache->get('run-malware', (string) $runId)['body'] ?? []) : [];
+            $this->malwareCatalog = $saved['catalog'] ?? $saved;
+        }
+        $catalog = $this->malwareCatalog;
         $github = new GithubMalware($this->client);
         $matches = [];
         $deps = [];
@@ -393,7 +432,7 @@ final class ScanSlice
         }
 
         return $this->write(function () use ($id, $repo, $inventory, $pending, $deps, $matches, $runId): bool {
-            $result = (new Matcher(new GroupStore($this->store)))->exposures($deps, $pending, $this->osvResults, $matches);
+            $result = (new Matcher(new GroupStore($this->pdo)))->exposures($deps, $pending, $this->osvResults, $matches);
             $transitions = (new Reconciler(new FindingModel($this->pdo)))->apply(
                 $runId, $id, $inventory ? $repo['outcome'] : null, $result['exposures'], $inventory, ($this->clock)(),
             );
@@ -528,9 +567,6 @@ final class ScanSlice
 
     private function filterPending(): void
     {
-        if ($this->denyPrefixes === []) {
-            return;
-        }
         foreach ($this->rows("SELECT id, name FROM gumshoe_pending WHERE run_id = ? AND egress = 'public'", [$this->id()]) as $row) {
             if ($this->denied($row['name'])) {
                 $this->execute("UPDATE gumshoe_pending SET egress = 'denied' WHERE id = ?", [$row['id']]);
@@ -597,7 +633,7 @@ final class ScanSlice
         }
     }
 
-    private function backoff(string $error, ?int $retryAt = null, ?int $position = null): bool
+    private function backoff(string $error, ?int $retryAt = null, int|string|null $position = null): bool
     {
         $this->clearUnexpected();
         $this->log->checkpoint($this->id(), $this->run['phase'], $position ?? $this->position(),
@@ -611,7 +647,7 @@ final class ScanSlice
         return max($now + 1, $retryAt ?? $now + self::RETRY_DELAY);
     }
 
-    private function sourceFailure(?int $retryAt, ?int $position = null): bool
+    private function sourceFailure(?int $retryAt, int|string|null $position = null): bool
     {
         if ($this->run['exception_class'] !== null && ($position === null || $position === $this->position())) {
             $this->finish('failed', HttpFailure::class, $this->retryTime($retryAt));
@@ -624,10 +660,11 @@ final class ScanSlice
     {
         $this->execute("DELETE FROM gumshoe_advisory_cache WHERE (source = 'run-malware' AND advisory_id = ?)
             OR (source = 'run-transition' AND advisory_id LIKE ?)", [(string) $this->id(), $this->id().':%']);
+        $this->log->clearInventory($this->id());
         $this->log->finish($this->id(), $status, ($this->clock)(), $error, $retryAt);
     }
 
-    private function advance(string $phase, ?int $position = null, ?int $retryAt = null): bool
+    private function advance(string $phase, int|string|null $position = null, ?int $retryAt = null): bool
     {
         $this->clearUnexpected();
         $this->log->checkpoint($this->id(), $phase, $position, $retryAt);
@@ -657,15 +694,10 @@ final class ScanSlice
         return $id === null ? null : (int) $id;
     }
 
-    private function lastPendingId(): ?int
+    private function position(): int|string|null
     {
-        $id = $this->execute('SELECT MAX(id) FROM gumshoe_pending WHERE run_id = ?', [$this->id()])->fetchColumn();
-        return $id === null ? null : (int) $id;
-    }
-
-    private function position(): ?int
-    {
-        return $this->run['position'] === null ? null : (int) $this->run['position'];
+        $position = $this->run['position'];
+        return $position !== null && ctype_digit((string) $position) ? (int) $position : $position;
     }
 
     private function id(): int

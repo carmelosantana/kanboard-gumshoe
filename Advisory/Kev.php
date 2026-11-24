@@ -21,17 +21,25 @@ final class Kev
 
     public function refresh(): void
     {
+        $this->store($this->fetch(), time());
+    }
+
+    public function fetch(): array
+    {
         foreach ([self::OFFICIAL, self::MIRROR] as $url) {
             try {
-                $entries = $this->download($url);
+                return $this->download($url);
             } catch (HttpFailure $failure) {
                 continue;
             }
-            $this->cache->put('kev', self::CATALOG, $entries, null, time());
-            $this->entries = $entries;
-            return;
         }
         throw $failure;
+    }
+
+    public function store(array $entries, int $now): void
+    {
+        $this->cache->put('kev', self::CATALOG, $entries, null, $now);
+        $this->entries = $entries;
     }
 
     public function contains(string $cve): bool

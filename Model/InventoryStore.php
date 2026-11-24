@@ -36,7 +36,10 @@ final class InventoryStore
      */
     public function apply(int $runId, int $repoId, array $scan, Policy $policy): void
     {
-        $this->pdo->beginTransaction();
+        $ownsTransaction = !$this->pdo->inTransaction();
+        if ($ownsTransaction) {
+            $this->pdo->beginTransaction();
+        }
         try {
             $repo = $this->execute('SELECT last_complete_at FROM gumshoe_repos WHERE id = ?', [$repoId])
                 ->fetch(PDO::FETCH_ASSOC);
@@ -94,9 +97,11 @@ final class InventoryStore
                     last_complete_at = COALESCE(?, last_complete_at) WHERE id = ?',
                 [$scan['headSha'], $scan['treeSha'], $complete ? 'complete' : 'partial', $complete ? $now : null, $repoId],
             );
-            $this->pdo->commit();
+            if ($ownsTransaction) {
+                $this->pdo->commit();
+            }
         } catch (Throwable $error) {
-            if ($this->pdo->inTransaction()) {
+            if ($ownsTransaction && $this->pdo->inTransaction()) {
                 $this->pdo->rollBack();
             }
             throw $error;

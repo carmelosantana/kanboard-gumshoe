@@ -5,7 +5,6 @@ namespace Kanboard\Plugin\Gumshoe\Run;
 use Closure;
 use LogicException;
 use PDO;
-use PDOStatement;
 use Throwable;
 
 final readonly class WriterLease
@@ -83,63 +82,5 @@ final readonly class WriterLease
             }
             throw $failure;
         }
-    }
-
-    /**
-     * The inventory and advisory stores own their standalone PDO transactions.
-     * Inside a fenced batch, their transactions become savepoints on the same
-     * connection, so neither their writes nor their checkpoint can commit early.
-     */
-    public function storeConnection(): PDO
-    {
-        return new class($this->pdo) extends PDO {
-            private bool $savepoint = false;
-
-            public function __construct(private readonly PDO $connection)
-            {
-            }
-
-            public function beginTransaction(): bool
-            {
-                if (!$this->connection->inTransaction() || $this->savepoint) {
-                    throw new LogicException('A store transaction requires an enclosing writer batch.');
-                }
-                $this->connection->exec('SAVEPOINT gumshoe_store');
-                return $this->savepoint = true;
-            }
-
-            public function commit(): bool
-            {
-                $this->connection->exec('RELEASE SAVEPOINT gumshoe_store');
-                $this->savepoint = false;
-                return true;
-            }
-
-            public function rollBack(): bool
-            {
-                $this->connection->exec('ROLLBACK TO SAVEPOINT gumshoe_store');
-                return $this->commit();
-            }
-
-            public function inTransaction(): bool
-            {
-                return $this->savepoint && $this->connection->inTransaction();
-            }
-
-            public function prepare(string $query, array $options = []): PDOStatement|false
-            {
-                return $this->connection->prepare($query, $options);
-            }
-
-            public function lastInsertId(?string $name = null): string|false
-            {
-                return $this->connection->lastInsertId($name);
-            }
-
-            public function getAttribute(int $attribute): mixed
-            {
-                return $this->connection->getAttribute($attribute);
-            }
-        };
     }
 }

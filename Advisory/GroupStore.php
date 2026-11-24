@@ -28,7 +28,10 @@ final readonly class GroupStore
 
         $aliases = array_values(array_unique($aliases));
         $placeholders = implode(', ', array_fill(0, count($aliases), '?'));
-        $this->pdo->beginTransaction();
+        $ownsTransaction = !$this->pdo->inTransaction();
+        if ($ownsTransaction) {
+            $this->pdo->beginTransaction();
+        }
         try {
             $groups = $this->execute(
                 "SELECT id, cvss_max, malware, kev FROM gumshoe_groups
@@ -79,13 +82,15 @@ final readonly class GroupStore
                 $this->execute('INSERT INTO gumshoe_group_aliases (alias, group_id) VALUES (?, ?)', [$alias, $id]);
             }
 
-            $this->pdo->commit();
+            if ($ownsTransaction) {
+                $this->pdo->commit();
+            }
             return [
                 'group' => ['id' => $id, 'primary_id' => $primary, 'cvss_max' => $cvss, 'malware' => $malware, 'kev' => $kev],
                 'merged' => $merged,
             ];
         } catch (Throwable $error) {
-            if ($this->pdo->inTransaction()) {
+            if ($ownsTransaction && $this->pdo->inTransaction()) {
                 $this->pdo->rollBack();
             }
             throw $error;

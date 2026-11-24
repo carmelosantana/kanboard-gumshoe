@@ -29,28 +29,52 @@ final class Osv
     /** Process due public rows. Returns the next retry time, or null when no public rows remain pending. */
     public function queryPending(int $runId): ?int
     {
-        $now = ($this->clock)();
+        $cached = $this->cachedVersions();
+        while (($rows = $this->dueRows($runId)) !== []) {
+            $batch = $this->fetch($rows, $cached);
+            $this->pdo->beginTransaction();
+            try {
+                $this->store($batch);
+                $this->pdo->commit();
+            } catch (\Throwable $failure) {
+                $this->pdo->rollBack();
+                throw $failure;
+            }
+            if ($batch['retryAt'] !== null) {
+                return $batch['retryAt'];
+            }
+            foreach ($batch['records'] as $id => $record) {
+                $cached[$id] = $record['modified'];
+            }
+        }
+        return $this->pendingRetryAt($runId);
+    }
+
+    public function dueRows(int $runId): array
+    {
         $pending = $this->pdo->prepare(
             "SELECT id, query_type, ecosystem, name, version FROM gumshoe_pending
              WHERE run_id = ? AND egress = 'public' AND state = 'pending' AND (retry_at IS NULL OR retry_at <= ?)
              ORDER BY id LIMIT ".self::BATCH_SIZE
         );
-        while (true) {
-            $pending->execute([$runId, $now]);
-            $rows = $pending->fetchAll(PDO::FETCH_ASSOC);
-            if ($rows === []) {
-                break;
-            }
-            if (($retryAt = $this->process($rows)) !== null) {
-                return $retryAt;
-            }
-        }
+        $pending->execute([$runId, ($this->clock)()]);
+        return $pending->fetchAll(PDO::FETCH_ASSOC);
+    }
+
+    public function pendingRetryAt(int $runId): ?int
+    {
         $next = $this->pdo->prepare(
             "SELECT MIN(retry_at) FROM gumshoe_pending WHERE run_id = ? AND egress = 'public' AND state = 'pending'"
         );
         $next->execute([$runId]);
         $retryAt = $next->fetchColumn();
         return $retryAt === null ? null : (int) $retryAt;
+    }
+
+    public function cachedVersions(): array
+    {
+        return $this->pdo->query("SELECT advisory_id, modified FROM gumshoe_advisory_cache WHERE source = 'osv'")
+            ->fetchAll(PDO::FETCH_KEY_PAIR);
     }
 
     /** @return array<int, list<array>> Completed results keyed by pending row ID. An empty list is a completed clean query. */
@@ -81,46 +105,47 @@ final class Osv
         return $this->pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? 'CHAR' : 'TEXT';
     }
 
-    private function process(array $rows): ?int
+    /** Fetch a single batch and its advisory details without touching the database. */
+    public function fetch(array $rows, array $cached): array
     {
         $retryAt = null;
+        $records = [];
+        $matches = [];
         try {
             $queries = array_map($this->query(...), $rows);
             $pages = $this->batch($queries, $retryAt);
-            $matches = [];
             foreach ($rows as $index => $row) {
-                $matches[$row['id']] = $this->collect($queries[$index], $pages[$index], $retryAt);
+                $matches[$row['id']] = $this->collect($queries[$index], $pages[$index], $retryAt, $cached, $records);
             }
         } catch (HttpFailure) {
-            $retryAt = max(($this->clock)() + 1, $retryAt ?? ($this->clock)() + 60);
-            $this->pdo->beginTransaction();
-            try {
-                $retry = $this->pdo->prepare("UPDATE gumshoe_pending SET retry_at = ? WHERE id = ? AND state = 'pending'");
-                foreach ($rows as $row) {
-                    $retry->execute([$retryAt, $row['id']]);
-                }
-                $this->pdo->commit();
-            } catch (\Throwable $failure) {
-                $this->pdo->rollBack();
-                throw $failure;
+            $now = ($this->clock)();
+            $retryAt = max($now + 1, $retryAt ?? $now + 60);
+            $matches = [];
+        }
+
+        return ['ids' => array_column($rows, 'id'), 'matches' => $matches, 'records' => $records, 'retryAt' => $retryAt];
+    }
+
+    /** Publish the batch inside the caller's transaction. */
+    public function store(array $batch): void
+    {
+        foreach ($batch['records'] as $id => $record) {
+            $this->cache->put('osv', $id, $record, $record['modified'], ($this->clock)());
+        }
+        if ($batch['retryAt'] !== null) {
+            $retry = $this->pdo->prepare("UPDATE gumshoe_pending SET retry_at = ? WHERE id = ? AND state = 'pending'");
+            foreach ($batch['ids'] as $id) {
+                $retry->execute([$batch['retryAt'], $id]);
             }
-            return $retryAt;
+            return;
         }
 
         // Keep the association with the pending row across scanner slices and restarts.
-        $this->pdo->beginTransaction();
-        try {
-            $done = $this->pdo->prepare("UPDATE gumshoe_pending SET state = 'done', page_token = NULL, retry_at = NULL WHERE id = ? AND state = 'pending'");
-            foreach ($matches as $id => $ids) {
-                $done->execute([$id]);
-                $this->cache->put(self::RESULTS, (string) $id, $ids, null, ($this->clock)());
-            }
-            $this->pdo->commit();
-        } catch (\Throwable $failure) {
-            $this->pdo->rollBack();
-            throw $failure;
+        $done = $this->pdo->prepare("UPDATE gumshoe_pending SET state = 'done', page_token = NULL, retry_at = NULL WHERE id = ? AND state = 'pending'");
+        foreach ($batch['matches'] as $id => $ids) {
+            $done->execute([$id]);
+            $this->cache->put(self::RESULTS, (string) $id, $ids, null, ($this->clock)());
         }
-        return null;
     }
 
     private function query(array $row): array
@@ -157,7 +182,7 @@ final class Osv
         return $result->results;
     }
 
-    private function collect(array $query, mixed $page, ?int &$retryAt): array
+    private function collect(array $query, mixed $page, ?int &$retryAt, array $cached, array &$records): array
     {
         $ids = [];
         $seen = [];
@@ -174,7 +199,7 @@ final class Osv
                     || self::timestamp($modified) === null) {
                     throw new HttpFailure('osv.querybatch', self::HOST, 200, 'invalid_response');
                 }
-                $this->fetchAdvisory($id, $modified, $retryAt);
+                $this->fetchAdvisory($id, $modified, $retryAt, $cached, $records);
                 $ids[$id] = $id;
             }
             if (!property_exists($page, 'next_page_token') || $page->next_page_token === '') {
@@ -189,11 +214,11 @@ final class Osv
         }
     }
 
-    private function fetchAdvisory(string $id, string $modified, ?int &$retryAt): void
+    private function fetchAdvisory(string $id, string $modified, ?int &$retryAt, array $cached, array &$records): void
     {
-        $cached = $this->cache->get('osv', $id);
+        $known = $records[$id]['modified'] ?? $cached[$id] ?? null;
         $expected = self::timestamp($modified);
-        if ($cached !== null && self::timestamp($cached['modified']) >= $expected) {
+        if ($known !== null && self::timestamp($known) >= $expected) {
             return;
         }
         $record = $this->send(new Request('osv.vulns', self::API.'vulns/'.rawurlencode($id)), $retryAt);
@@ -201,7 +226,7 @@ final class Osv
         if (($record->id ?? null) !== $id || $updated === null || $updated < $expected) {
             throw new HttpFailure('osv.vulns', self::HOST, 200, 'invalid_response');
         }
-        $this->cache->put('osv', $id, (array) $record, $record->modified, ($this->clock)());
+        $records[$id] = (array) $record;
     }
 
     private function send(Request $request, ?int &$retryAt): mixed
