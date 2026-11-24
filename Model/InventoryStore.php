@@ -2,6 +2,7 @@
 
 namespace Kanboard\Plugin\Gumshoe\Model;
 
+use Closure;
 use Kanboard\Plugin\Gumshoe\Egress\Policy;
 use Kanboard\Plugin\Gumshoe\Inventory\Differ;
 use Kanboard\Plugin\Gumshoe\Inventory\ParseResult;
@@ -12,8 +13,11 @@ use Throwable;
 
 final class InventoryStore
 {
-    public function __construct(private readonly PDO $pdo)
+    private readonly Closure $clock;
+
+    public function __construct(private readonly PDO $pdo, ?Closure $clock = null)
     {
+        $this->clock = $clock ?? time(...);
     }
 
     /**
@@ -74,7 +78,7 @@ final class InventoryStore
                 }
             }
 
-            $now = time();
+            $now = ($this->clock)();
             $firstComplete = $complete && $repo['last_complete_at'] === null;
             if ($firstComplete) {
                 $this->recordChange($runId, $repoId, $now, ['kind' => 'new_repo']);

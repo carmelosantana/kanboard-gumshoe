@@ -39,6 +39,14 @@ final class InventoryStoreTest extends Base
         $this->store = new InventoryStore($this->pdo);
     }
 
+    public function testUsesInjectedClockForInventoryTimestamps(): void
+    {
+        $this->store = new InventoryStore($this->pdo, static fn (): int => 123);
+        $this->apply(1, [$this->file('a', $this->parsed('4.0.0'))]);
+        self::assertSame(123, (int) $this->rows('dep_changes')[0]['created_at']);
+        self::assertSame(123, (int) $this->rows('repos')[0]['last_complete_at']);
+    }
+
     public function testFirstCompleteScanRecordsBaselineThenVersionChanges(): void
     {
         $this->apply(1, [$this->file('a', $this->parsed('4.0.0'))]);
