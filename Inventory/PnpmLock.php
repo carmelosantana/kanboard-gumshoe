@@ -85,13 +85,16 @@ final class PnpmLock
             $name = substr($base, 0, $separator);
             $version = substr($base, $separator + 1);
             $queryable = preg_match('/\A'.self::REGISTRY_VERSION.'\z/', $version) === 1;
-            $public = $queryable && (array_key_exists('tarball', $resolution)
+            $hasTarball = array_key_exists('tarball', $resolution);
+            $public = $queryable && ($hasTarball
                 ? self::isNpmRegistry($resolution['tarball'])
                 : $defaultRegistry && !isset($resolution['type']));
+            $inferred = !$hasTarball;
             $scope = $scopes[$base] ?? $scope;
 
             if (isset($rows[$base])) {
                 $public = $public && $rows[$base]->registry_evidence === 'npmjs';
+                $inferred = $inferred || $rows[$base]->evidence_inferred;
                 $scope = $rows[$base]->scope === 'prod' ? 'prod' : $scope;
             }
             $rows[$base] = new Dependency(
@@ -102,6 +105,7 @@ final class PnpmLock
                 null,
                 $queryable ? Dependency::QUERY_PACKAGE : Dependency::QUERY_NONE,
                 $public ? 'npmjs' : null,
+                $public && $inferred,
             );
         }
 

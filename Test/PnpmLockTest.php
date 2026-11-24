@@ -36,7 +36,7 @@ final class PnpmLockTest extends TestCase
               is-positive@1.0.0: {}
             YAML;
         $expected = array_map(
-            static fn ($name) => new Dependency('npm', $name, '1.0.0', 'prod', null, 'package', 'npmjs'),
+            static fn ($name) => new Dependency('npm', $name, '1.0.0', 'prod', null, 'package', 'npmjs', true),
             ['@pnpm.e2e/external-depend-on-internal-dep', 'is-negative', 'is-positive'],
         );
 
@@ -132,11 +132,25 @@ final class PnpmLockTest extends TestCase
         $result = PnpmLock::parse($contents, new Limits());
         self::assertSame('ok', $result->status);
         self::assertSame(['npmjs', null, 'npmjs'], array_column($result->deps, 'registry_evidence'));
+        self::assertSame([true, false, false], array_column($result->deps, 'evidence_inferred'));
 
         foreach (["registry: https://example.com/\n", "settings: {registry: 'https://example.com/'}\n"] as $registry) {
             $result = PnpmLock::parse($registry.$contents, new Limits());
             self::assertSame('ok', $result->status);
             self::assertSame([null, null, 'npmjs'], array_column($result->deps, 'registry_evidence'));
+            self::assertSame([false, false, false], array_column($result->deps, 'evidence_inferred'));
+        }
+    }
+
+    public function testPeerVariantsRequireRegistryConfigIfEitherVariantOmitsTarball(): void
+    {
+        $explicit = "  /is-number@6.0.0: {resolution: {tarball: 'https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz'}}\n";
+        $inferred = "  /is-number@6.0.0(is-odd@3.0.1): {}\n";
+        foreach ([$explicit.$inferred, $inferred.$explicit] as $packages) {
+            $result = PnpmLock::parse("lockfileVersion: '6.0'\npackages:\n".$packages, new Limits());
+            self::assertSame('ok', $result->status);
+            self::assertSame(['npmjs'], array_column($result->deps, 'registry_evidence'));
+            self::assertSame([true], array_column($result->deps, 'evidence_inferred'));
         }
     }
 

@@ -11,18 +11,12 @@ use Kanboard\Plugin\Gumshoe\Inventory\Limits;
 use Kanboard\Plugin\Gumshoe\Inventory\NpmLock;
 use Kanboard\Plugin\Gumshoe\Inventory\PnpmLock;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeTransport;
-use KanboardTests\units\Base;
+use PHPUnit\Framework\TestCase;
 
-use function Kanboard\Plugin\Gumshoe\Schema\version_1;
-
-require_once 'tests/units/Base.php';
 require_once __DIR__.'/bootstrap.php';
-require_once __DIR__.'/ReleasesConnection.php';
 
-final class EgressPolicyTest extends Base
+final class EgressPolicyTest extends TestCase
 {
-    use ReleasesConnection;
-
     private const SHA = '11bd71901bbe5b1630ceea73d27597364c9af683';
 
     /** @dataProvider packageCases */
@@ -119,7 +113,8 @@ final class EgressPolicyTest extends Base
             YAML, new Limits());
         self::assertSame('ok', $result->status);
         $policy = new Policy();
-        self::assertSame('public', $policy->verdict($result->deps[0], 'pnpm', hasNpmjsTarball: true));
+        self::assertSame('public', $policy->verdict($result->deps[0], 'pnpm'));
+        self::assertSame('public', $policy->verdict($result->deps[0], 'pnpm', ['registry' => 'example.org']));
         self::assertSame('private', $policy->verdict($result->deps[1], 'pnpm', []));
     }
 
@@ -143,26 +138,6 @@ final class EgressPolicyTest extends Base
         self::assertSame('public', $policy->verdict($recorded));
         self::assertSame('private', $policy->verdict($unknown));
         self::assertSame($requests, $transport->requests);
-    }
-
-    public function testStoresVerdictOnTheSelectedDependency(): void
-    {
-        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
-        $pdo = $this->container['db']->getConnection();
-        version_1($pdo);
-        $pdo->exec("INSERT INTO gumshoe_owners (login, kind) VALUES ('octokit', 'org')");
-        $pdo->exec("INSERT INTO gumshoe_repos (owner_id, name, github_id) VALUES (1, 'rest.js', 1)");
-        $pdo->exec("INSERT INTO gumshoe_lockfiles (repo_id, path_hash, path, blob_sha, kind, status, parser_version)
-            VALUES (1, 'a', 'package-lock.json', 'b', 'npm', 'ok', 1)");
-        $pdo->exec("INSERT INTO gumshoe_deps (lockfile_id, ecosystem, name, version, scope, query_type)
-            VALUES (1, 'npm', 'lodash', '1.0.0', 'prod', 'package'), (1, 'npm', 'arg', '1.0.0', 'prod', 'package')");
-
-        $dep = new Dependency('npm', 'lodash', '1.0.0', 'prod', null, 'package', 'npmjs');
-        (new Policy())->recordVerdict($pdo, 1, $dep, 'npm');
-        self::assertSame(['public', 'unqueryable'], $pdo->query('SELECT egress FROM gumshoe_deps ORDER BY id')->fetchAll(\PDO::FETCH_COLUMN));
-
-        (new Policy(['lodash']))->recordVerdict($pdo, 1, $dep, 'npm');
-        self::assertSame(['denied', 'unqueryable'], $pdo->query('SELECT egress FROM gumshoe_deps ORDER BY id')->fetchAll(\PDO::FETCH_COLUMN));
     }
 
     public function testHostileNpmNameIsUnqueryableDespiteRegistryEvidence(): void

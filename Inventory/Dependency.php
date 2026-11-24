@@ -16,6 +16,7 @@ final readonly class Dependency
         public ?string $source,
         public string $query_type,
         public ?string $registry_evidence,
+        public bool $evidence_inferred = false,
     ) {
     }
 }

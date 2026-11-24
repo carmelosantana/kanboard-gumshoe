@@ -2,8 +2,11 @@
 
 namespace Kanboard\Plugin\Gumshoe\Test;
 
+use Kanboard\Plugin\Gumshoe\Egress\Policy;
 use Kanboard\Plugin\Gumshoe\Inventory\Dependency;
+use Kanboard\Plugin\Gumshoe\Inventory\Limits;
 use Kanboard\Plugin\Gumshoe\Inventory\ParseResult;
+use Kanboard\Plugin\Gumshoe\Inventory\PnpmLock;
 use Kanboard\Plugin\Gumshoe\Model\InventoryStore;
 use KanboardTests\units\Base;
 use PDO;
@@ -42,7 +45,7 @@ final class InventoryStoreTest extends Base
         self::assertSame(['new_repo'], array_column($this->rows('dep_changes'), 'kind'));
         self::assertSame([
             'ecosystem' => 'npm', 'name' => 'universal-user-agent', 'version' => '4.0.0',
-            'scope' => 'prod', 'source' => null, 'query_type' => 'package', 'egress' => 'unqueryable',
+            'scope' => 'prod', 'source' => null, 'query_type' => 'package', 'egress' => 'public',
         ], array_diff_key($this->rows('deps')[0], array_flip(['id', 'lockfile_id'])));
         $firstFileId = $this->rows('lockfiles')[0]['id'];
 
@@ -79,6 +82,52 @@ final class InventoryStoreTest extends Base
         self::assertSame(2, $calls);
         self::assertSame(2, (int) $this->rows('lockfiles')[0]['parser_version']);
         self::assertSame(['new_repo'], array_column($this->rows('dep_changes'), 'kind'));
+    }
+
+    public function testStoresPnpmVerdictsUsingEachLockfilesRegistryConfig(): void
+    {
+        $result = PnpmLock::parse(<<<'YAML'
+            lockfileVersion: '9.0'
+            packages:
+              '@types/node@22.0.0': {}
+              is-number@6.0.0: {resolution: {tarball: 'https://registry.npmjs.org/is-number/-/is-number-6.0.0.tgz'}}
+            YAML, new Limits());
+        $file = array_replace($this->file('a', $result, path: 'pnpm-lock.yaml'), ['kind' => 'pnpm']);
+        $this->apply(1, [$file, array_replace($file, [
+            'path' => 'tools/pnpm-lock.yaml', 'registryConfig' => [],
+        ])]);
+        self::assertSame(['private', 'public', 'public', 'public'], array_column($this->rows('deps'), 'egress'));
+
+        $this->apply(2, [$file, array_replace($file, [
+            'path' => 'tools/pnpm-lock.yaml', 'registryConfig' => ['@types' => 'example.org'],
+        ])]);
+        self::assertSame(['private', 'public', 'private', 'public'], array_column($this->rows('deps'), 'egress'));
+        self::assertSame(['new_repo'], array_column($this->rows('dep_changes'), 'kind'));
+    }
+
+    public function testRefreshesActionVisibilityAndDenyPrefixesOnAnUnchangedWorkflow(): void
+    {
+        $result = new ParseResult([
+            new Dependency('actions', 'actions/checkout', '11bd71901bbe5b1630ceea73d27597364c9af683', 'action', null, 'commit', null),
+        ]);
+        $file = array_replace($this->file('a', $result, path: '.github/workflows/ci.yml'), ['kind' => 'actions']);
+        $public = ['actions/checkout' => true];
+        $this->apply(1, [$file], policy: new Policy(githubVisibility: $public));
+        self::assertSame(['public'], array_column($this->rows('deps'), 'egress'));
+        $this->apply(2, [$file]);
+        self::assertSame(['private'], array_column($this->rows('deps'), 'egress'));
+        $this->apply(3, [$file], policy: new Policy(['actions/'], $public));
+        self::assertSame(['denied'], array_column($this->rows('deps'), 'egress'));
+    }
+
+    public function testRemovingDenyPrefixRefreshesAnUnchangedLazyLockfile(): void
+    {
+        $file = $this->file('a', fn (): ParseResult => $this->parsed('4.0.0'));
+        $this->apply(1, [$file], policy: new Policy(['universal-user-']));
+        self::assertSame(['denied'], array_column($this->rows('deps'), 'egress'));
+
+        $this->apply(2, [$file]);
+        self::assertSame(['public'], array_column($this->rows('deps'), 'egress'));
     }
 
     public function testIncompleteParseKeepsLastCompleteRowsAndIsRetried(): void
@@ -167,12 +216,12 @@ final class InventoryStoreTest extends Base
         self::assertSame(['new_repo', 'changed'], array_column($this->rows('dep_changes'), 'kind'));
     }
 
-    private function apply(int $runId, array $files, bool $treeComplete = true): void
+    private function apply(int $runId, array $files, bool $treeComplete = true, ?Policy $policy = null): void
     {
         $this->store->apply($runId, 1, [
             'treeComplete' => $treeComplete, 'headSha' => $this->sha((string) $runId), 'treeSha' => $this->sha('f'),
             'files' => $files,
-        ]);
+        ], $policy);
     }
 
     private function file(string $sha, ParseResult|callable $result, int $parserVersion = 1, string $path = self::PATH): array

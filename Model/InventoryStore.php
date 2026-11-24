@@ -2,6 +2,7 @@
 
 namespace Kanboard\Plugin\Gumshoe\Model;
 
+use Kanboard\Plugin\Gumshoe\Egress\Policy;
 use Kanboard\Plugin\Gumshoe\Inventory\Differ;
 use Kanboard\Plugin\Gumshoe\Inventory\ParseResult;
 use PDO;
@@ -23,12 +24,16 @@ final class InventoryStore
      *     treeComplete: bool, headSha: ?string, treeSha: ?string,
      *     files: list<array{
      *         path: string, blob_sha: string, kind: string, parser_version: int,
-     *         result: ParseResult|callable(): ParseResult
+     *         result: ParseResult|callable(): ParseResult,
+     *         registryConfig?: array<string, string>|'unknown'
      *     }>
      * } $scan
+     * @param ?Policy $policy The current run's deny prefixes and GitHub visibility observations.
      */
-    public function apply(int $runId, int $repoId, array $scan): void
+    public function apply(int $runId, int $repoId, array $scan, ?Policy $policy = null): void
     {
+        $defaultPolicy = $policy === null;
+        $policy ??= new Policy();
         $this->pdo->beginTransaction();
         try {
             $repo = $this->execute('SELECT last_complete_at FROM gumshoe_repos WHERE id = ?', [$repoId])
@@ -49,9 +54,15 @@ final class InventoryStore
                 unset($remaining[$key]);
 
                 $result = $file['result'];
-                if ($stored !== null && $stored['status'] === 'ok' && $file['blob_sha'] === $stored['blob_sha']
-                    && $file['kind'] === $stored['kind'] && $file['parser_version'] === (int) $stored['parser_version']
-                    && (!$result instanceof ParseResult || $result->status === 'ok')) {
+                $unchanged = $stored !== null && $stored['status'] === 'ok' && $file['blob_sha'] === $stored['blob_sha']
+                    && $file['kind'] === $stored['kind'] && $file['parser_version'] === (int) $stored['parser_version'];
+                // The default policy can reuse cached verdicts for static evidence unless a prior policy denied a row.
+                if ($unchanged && !$result instanceof ParseResult && $defaultPolicy
+                    && !in_array($file['kind'], ['pnpm', 'actions'], true)
+                    && $this->execute(
+                        "SELECT 1 FROM gumshoe_deps WHERE lockfile_id = ? AND egress = 'denied' LIMIT 1",
+                        [$stored['id']],
+                    )->fetchColumn() === false) {
                     continue;
                 }
 
@@ -59,9 +70,9 @@ final class InventoryStore
                     $result = $result();
                 }
                 $ok = $result->status === 'ok';
-                $lockfileId = $this->saveFile($repoId, $key, $file, $stored, $ok);
+                $lockfileId = $unchanged && $ok ? (int) $stored['id'] : $this->saveFile($repoId, $key, $file, $stored, $ok);
                 if ($ok) {
-                    array_push($changes, ...$this->replaceDependencies($lockfileId, $file['path'], $result));
+                    array_push($changes, ...$this->replaceDependencies($lockfileId, $file, $result, $policy));
                 } else {
                     $complete = false;
                 }
@@ -125,31 +136,38 @@ final class InventoryStore
         )->fetchColumn();
     }
 
-    private function replaceDependencies(int $lockfileId, string $path, ParseResult $result): array
+    private function replaceDependencies(int $lockfileId, array $file, ParseResult $result, Policy $policy): array
     {
         $old = $this->execute(
-            'SELECT ecosystem, name, version FROM gumshoe_deps WHERE lockfile_id = ? ORDER BY id', [$lockfileId],
+            'SELECT ecosystem, name, version, scope, source, query_type, egress FROM gumshoe_deps WHERE lockfile_id = ? ORDER BY id',
+            [$lockfileId],
         )->fetchAll(PDO::FETCH_ASSOC);
-        foreach ($old as &$row) {
-            $row['path'] = $path;
+        $new = [];
+        foreach ($result->deps as $dependency) {
+            $new[] = [
+                'ecosystem' => $dependency->ecosystem,
+                'name' => $dependency->name,
+                'version' => $dependency->version ?? 'unresolved',
+                'scope' => $dependency->scope,
+                'source' => $dependency->source,
+                'query_type' => $dependency->query_type,
+                'egress' => $policy->verdict($dependency, $file['kind'], $file['registryConfig'] ?? 'unknown'),
+            ];
         }
-        unset($row);
+        if ($old === $new) {
+            return [];
+        }
 
         $this->execute('DELETE FROM gumshoe_deps WHERE lockfile_id = ?', [$lockfileId]);
         $insert = $this->pdo->prepare(
-            'INSERT INTO gumshoe_deps (lockfile_id, ecosystem, name, version, scope, source, query_type)
-                VALUES (?, ?, ?, ?, ?, ?, ?)',
+            'INSERT INTO gumshoe_deps (lockfile_id, ecosystem, name, version, scope, source, query_type, egress)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         );
-        $new = [];
-        foreach ($result->deps as $dependency) {
-            $version = $dependency->version ?? 'unresolved';
-            $insert->execute([
-                $lockfileId, $dependency->ecosystem, $dependency->name, $version,
-                $dependency->scope, $dependency->source, $dependency->query_type,
-            ]);
-            $new[] = ['ecosystem' => $dependency->ecosystem, 'name' => $dependency->name, 'version' => $version, 'path' => $path];
+        foreach ($new as $row) {
+            $insert->execute([$lockfileId, ...array_values($row)]);
         }
-        return Differ::diff($old, $new);
+        $withPath = static fn (array $row): array => $row + ['path' => $file['path']];
+        return Differ::diff(array_map($withPath, $old), array_map($withPath, $new));
     }
 
     private function recordChange(int $runId, int $repoId, int $now, array $change): void

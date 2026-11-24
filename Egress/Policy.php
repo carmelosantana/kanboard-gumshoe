@@ -3,7 +3,6 @@
 namespace Kanboard\Plugin\Gumshoe\Egress;
 
 use Kanboard\Plugin\Gumshoe\Inventory\Dependency;
-use PDO;
 
 final readonly class Policy
 {
@@ -21,16 +20,12 @@ final readonly class Policy
     }
 
     /**
-     * For npm dependencies, supply the lockfile kind to distinguish direct and inferred evidence.
-     *
      * @param array<string, string>|string $registryConfig TreeReader's registry host map or 'unknown'.
-     * @param bool $hasNpmjsTarball Whether every occurrence behind this pnpm row has an explicit npmjs tarball.
      */
     public function verdict(
         Dependency $dep,
         ?string $lockfileKind = null,
         array|string $registryConfig = 'unknown',
-        bool $hasNpmjsTarball = false,
     ): string {
         if ($dep->source === 'workspace') {
             return 'private';
@@ -49,11 +44,9 @@ final readonly class Policy
 
         $public = match ($dep->ecosystem) {
             'composer' => $dep->registry_evidence === 'packagist',
-            'npm' => $dep->registry_evidence === 'npmjs' && match ($lockfileKind) {
-                'npm' => true,
-                'pnpm' => $hasNpmjsTarball || self::usesNpmDefault($name, $registryConfig),
-                default => false,
-            },
+            'npm' => $dep->registry_evidence === 'npmjs'
+                && in_array($lockfileKind, ['npm', 'pnpm'], true)
+                && (!$dep->evidence_inferred || self::usesNpmDefault($name, $registryConfig)),
             'actions' => ($this->githubVisibility[$name] ?? null) === true,
         };
 
@@ -63,22 +56,6 @@ final readonly class Policy
     public function isCoverageGap(Dependency $dep, string $verdict): bool
     {
         return $dep->source !== 'workspace' && $verdict !== 'public';
-    }
-
-    /**
-     * Record a verdict for the matching inventory row inside the caller's write transaction.
-     */
-    public function recordVerdict(
-        PDO $pdo,
-        int $dependencyId,
-        Dependency $dep,
-        string $lockfileKind,
-        array|string $registryConfig = 'unknown',
-        bool $hasNpmjsTarball = false,
-    ): void {
-        $verdict = $this->verdict($dep, $lockfileKind, $registryConfig, $hasNpmjsTarball);
-        $statement = $pdo->prepare('UPDATE gumshoe_deps SET egress = ? WHERE id = ?');
-        $statement->execute([$verdict, $dependencyId]);
     }
 
     private static function isQueryable(Dependency $dep, string $name): bool
