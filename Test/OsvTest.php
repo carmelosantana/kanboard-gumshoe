@@ -8,15 +8,18 @@ use Kanboard\Plugin\Gumshoe\Http\Client;
 use Kanboard\Plugin\Gumshoe\Http\Response;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeTransport;
 use PDO;
-use PHPUnit\Framework\TestCase;
+use KanboardTests\units\Base;
 
 use function Kanboard\Plugin\Gumshoe\Schema\version_1;
 
 require_once __DIR__.'/bootstrap.php';
-require_once __DIR__.'/../Schema/Sqlite.php';
+require_once 'tests/units/Base.php';
+require_once __DIR__.'/ReleasesConnection.php';
 
-final class OsvTest extends TestCase
+final class OsvTest extends Base
 {
+    use ReleasesConnection;
+
     private const API = 'https://api.osv.dev/v1/';
     private const SHA = '11bd71901bbe5b1630ceea73d27597364c9af683';
     private const FIRST = 'GHSA-29mw-wpgm-hmr9';
@@ -102,26 +105,33 @@ final class OsvTest extends TestCase
         self::assertSame([1 => [], 2 => []], $osv->results(7));
     }
 
-    public function testMalformedOrInterruptedPagesRemainPending(): void
+    /** @dataProvider incompleteResponses */
+    public function testMalformedOrInterruptedPagesRemainPending(array $responses): void
     {
-        foreach ([
-            [self::json(['results' => [['vulns' => []]]])],
-            [new Response(200, [], '{"results":[{},[]]}')],
-            [self::json(['results' => [['next_page_token' => 'P:one:'], (object) []]]), new Response(503)],
-            [self::json(['results' => [['vulns' => [self::vuln(self::FIRST, self::NEW)]], (object) []]]), new Response(503)],
-        ] as $responses) {
-            [$pdo] = $this->database();
-            $this->add($pdo, 'npm', 'lodash', '4.17.20');
-            $this->add($pdo, 'composer', 'symfony/yaml', 'v4.0.0');
-            $osv = $this->osv($pdo, new FakeTransport($responses));
-            self::assertSame(1060, $osv->queryPending(7));
-            self::assertSame([], $osv->results(7));
-        }
+        [$pdo] = $this->database();
+        $this->add($pdo, 'npm', 'lodash', '4.17.20');
+        $this->add($pdo, 'composer', 'symfony/yaml', 'v4.0.0');
+        $osv = $this->osv($pdo, new FakeTransport($responses));
+        self::assertSame(1060, $osv->queryPending(7));
+        self::assertSame([], $osv->results(7));
+    }
+
+    public static function incompleteResponses(): iterable
+    {
+        yield 'wrong result count' => [[self::json(['results' => [['vulns' => []]]])]];
+        yield 'invalid result' => [[new Response(200, [], '{"results":[{},[]]}')]];
+        yield 'continuation fails' => [[
+            self::json(['results' => [['next_page_token' => 'P:one:'], (object) []]]), new Response(503),
+        ]];
+        yield 'record fetch fails' => [[
+            self::json(['results' => [['vulns' => [self::vuln(self::FIRST, self::NEW)]], (object) []]]), new Response(503),
+        ]];
     }
 
     private function database(): array
     {
-        $pdo = new PDO('sqlite::memory:');
+        $pdo = $this->container['db']->getConnection();
+        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
         version_1($pdo);
         return [$pdo, new AdvisoryCache($pdo)];
     }

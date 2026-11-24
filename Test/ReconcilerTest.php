@@ -15,22 +15,26 @@ use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeTransport;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeVaultSecrets;
 use Kanboard\Plugin\Vault\Secrets\SecretValue;
 use PDO;
-use PHPUnit\Framework\TestCase;
+use KanboardTests\units\Base;
 
 use function Kanboard\Plugin\Gumshoe\Schema\version_1;
 
 require_once __DIR__.'/bootstrap.php';
-require_once __DIR__.'/../Schema/Sqlite.php';
+require_once 'tests/units/Base.php';
+require_once __DIR__.'/ReleasesConnection.php';
 require_once __DIR__.'/Fakes/FakeVaultSecrets.php';
 
-final class ReconcilerTest extends TestCase
+final class ReconcilerTest extends Base
 {
+    use ReleasesConnection;
+
     private PDO $pdo;
 
     protected function setUp(): void
     {
-        $this->pdo = new PDO('sqlite::memory:');
-        $this->pdo->exec('PRAGMA foreign_keys = ON');
+        parent::setUp();
+        $this->pdo = $this->container['db']->getConnection();
+        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
         version_1($this->pdo);
         $this->pdo->exec(<<<'SQL'
             INSERT INTO gumshoe_owners (login, kind) VALUES ('octokit', 'org');
@@ -42,9 +46,10 @@ final class ReconcilerTest extends TestCase
                 VALUES (1, 1, 7, 'affected', 1);
             INSERT INTO gumshoe_exposures (finding_id, repo_id, lockfile_id, version, first_seen, last_seen)
                 VALUES (1, 1, 1, '0.1.1', 10, 10);
-            INSERT INTO gumshoe_runs (job, "trigger", started_at) VALUES
-                ('gumshoe.inventory', 'cli', 20), ('gumshoe.osv-recheck', 'cli', 20);
             SQL);
+        $trigger = DB_DRIVER === 'mysql' ? '`trigger`' : '"trigger"';
+        $this->pdo->exec("INSERT INTO gumshoe_runs (job, $trigger, started_at) VALUES
+            ('gumshoe.inventory', 'cli', 20), ('gumshoe.osv-recheck', 'cli', 20)");
         $this->addLockfile(1, 1, 'package-lock.json');
     }
 

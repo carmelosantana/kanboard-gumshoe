@@ -8,23 +8,26 @@ use Kanboard\Plugin\Gumshoe\Http\Client;
 use Kanboard\Plugin\Gumshoe\Http\HttpFailure;
 use Kanboard\Plugin\Gumshoe\Http\Response;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeTransport;
-use PDO;
-use PHPUnit\Framework\TestCase;
+use KanboardTests\units\Base;
 
 use function Kanboard\Plugin\Gumshoe\Schema\version_1;
 
 require_once __DIR__.'/bootstrap.php';
-require_once __DIR__.'/../Schema/Sqlite.php';
+require_once 'tests/units/Base.php';
+require_once __DIR__.'/ReleasesConnection.php';
 
-final class KevTest extends TestCase
+final class KevTest extends Base
 {
+    use ReleasesConnection;
+
     private const OFFICIAL = 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json';
     private const MIRROR = 'https://raw.githubusercontent.com/cisagov/kev-data/main/known_exploited_vulnerabilities.json';
 
     /** @dataProvider invalidCatalogs */
     public function testAcceptsMirrorAndKeepsLastGoodCatalogOnInvalidRefresh(string $invalid): void
     {
-        $pdo = new PDO('sqlite::memory:');
+        $pdo = $this->container['db']->getConnection();
+        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
         version_1($pdo);
         $valid = file_get_contents(__DIR__.'/fixtures/kev/known_exploited_vulnerabilities.json');
         $firstCve = json_decode($valid, true, flags: JSON_THROW_ON_ERROR)['vulnerabilities'][0]['cveID'];

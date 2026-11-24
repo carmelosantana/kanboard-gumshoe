@@ -4,16 +4,18 @@ namespace Kanboard\Plugin\Gumshoe\Test;
 
 use Kanboard\Plugin\Gumshoe\Advisory\GroupStore;
 use Kanboard\Plugin\Gumshoe\Finding\Matcher;
-use PDO;
-use PHPUnit\Framework\TestCase;
+use KanboardTests\units\Base;
 
 use function Kanboard\Plugin\Gumshoe\Schema\version_1;
 
 require_once __DIR__.'/bootstrap.php';
-require_once __DIR__.'/../Schema/Sqlite.php';
+require_once 'tests/units/Base.php';
+require_once __DIR__.'/ReleasesConnection.php';
 
-final class MatcherTest extends TestCase
+final class MatcherTest extends Base
 {
+    use ReleasesConnection;
+
     private const MAL = 'MAL-2025-20690';
     private const GHSA = 'GHSA-9gx6-6372-9mwg';
     private const SHA = '11bd71901bbe5b1630ceea73d27597364c9af683';
@@ -23,7 +25,9 @@ final class MatcherTest extends TestCase
 
     protected function setUp(): void
     {
-        $pdo = new PDO('sqlite::memory:');
+        parent::setUp();
+        $pdo = $this->container['db']->getConnection();
+        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
         version_1($pdo);
         $this->groups = new GroupStore($pdo);
     }
