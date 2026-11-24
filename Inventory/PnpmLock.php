@@ -7,6 +7,8 @@ use UnexpectedValueException;
 
 final class PnpmLock
 {
+    private const REGISTRY_VERSION = '\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?';
+
     public static function parse(string $contents, Limits $limits): ParseResult
     {
         $documents = Yaml::parseDocuments($contents);
@@ -61,16 +63,32 @@ final class PnpmLock
             }
 
             $id = self::packageId($key, $major);
+            $resolution = self::map($package, 'resolution');
+            $scope = $major === 6 && ($package['dev'] ?? false) === true ? 'dev' : 'prod';
+            if ($id === null) {
+                if ($major !== 6) {
+                    throw new UnexpectedValueException();
+                }
+                $rows['opaque:'.$key] = new Dependency(
+                    'npm',
+                    is_string($package['name'] ?? null) ? $package['name'] : $key,
+                    is_string($package['version'] ?? null) ? $package['version'] : null,
+                    $scope,
+                    null,
+                    Dependency::QUERY_NONE,
+                    null,
+                );
+                continue;
+            }
             $base = explode('(', $id, 2)[0];
             $separator = strpos($base, '@', 1);
             $name = substr($base, 0, $separator);
             $version = substr($base, $separator + 1);
-            $resolution = self::map($package, 'resolution');
-            $queryable = preg_match('/\A\d+\.\d+\.\d+(?:-[\w.-]+)?(?:\+[\w.-]+)?\z/', $version) === 1;
+            $queryable = preg_match('/\A'.self::REGISTRY_VERSION.'\z/', $version) === 1;
             $public = $queryable && (array_key_exists('tarball', $resolution)
                 ? self::isNpmRegistry($resolution['tarball'])
                 : $defaultRegistry && !isset($resolution['type']));
-            $scope = $major === 6 ? (($package['dev'] ?? false) === true ? 'dev' : 'prod') : ($scopes[$base] ?? 'prod');
+            $scope = $scopes[$base] ?? $scope;
 
             if (isset($rows[$base])) {
                 $public = $public && $rows[$base]->registry_evidence === 'npmjs';
@@ -90,15 +108,15 @@ final class PnpmLock
         yield from $rows;
     }
 
-    private static function packageId(string $key, int $major): string
+    private static function packageId(string $key, int $major): ?string
     {
         if ($major === 6) {
             $key = str_starts_with($key, '/') ? substr($key, 1) : $key;
         }
 
-        $separator = $major === 6 ? '[@/]' : '@';
-        if (preg_match('#\A((?:@[\w.~-]+/)?[\w.~-]+)'.$separator.'([^\s(][^\s]*)\z#D', $key, $identity) !== 1) {
-            throw new UnexpectedValueException();
+        $version = $major === 6 ? '[@/]('.self::REGISTRY_VERSION.'(?:\([^\s]*\))?)' : '@([^\s(][^\s]*)';
+        if (preg_match('#\A((?:@[\w.~-]+/)?[\w.~-]+)'.$version.'\z#D', $key, $identity) !== 1) {
+            return null;
         }
         return $identity[1].'@'.$identity[2];
     }

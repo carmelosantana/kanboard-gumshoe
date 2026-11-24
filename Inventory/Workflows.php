@@ -57,7 +57,15 @@ final class Workflows
     private static function dependency(string $reference): ?Dependency
     {
         if (str_starts_with($reference, 'docker://') && strlen($reference) > 9) {
-            return new Dependency('docker', substr($reference, 9), null, 'action', null, Dependency::QUERY_NONE, null);
+            $image = substr($reference, 9);
+            [$name, $version] = array_pad(explode('@', $image, 2), 2, null);
+            $tag = strrpos($name, ':');
+            $slash = strrpos($name, '/');
+            if ($tag !== false && ($slash === false || $tag > $slash)) {
+                $version ??= substr($name, $tag + 1);
+                $name = substr($name, 0, $tag);
+            }
+            return new Dependency('docker', $name, $version, 'action', null, Dependency::QUERY_NONE, null);
         }
         if (preg_match('~\A([a-z\d-]+/[a-z\d_.-]+)(?:/[^@\s]+)?@([^@\s]+)\z~i', $reference, $match) !== 1) {
             return null;

@@ -51,6 +51,23 @@ final class YamlTest extends TestCase
         self::assertSame(2, substr_count($documents[0]['packages']['is-positive@3.1.0']['deprecated'], "---\n"));
     }
 
+    public function testAcceptsNestedAnchorsInBlockAndFlowCollections(): void
+    {
+        $documents = Yaml::parseDocuments(<<<'YAML'
+            base: &base
+            - first
+            - second
+            nested: &nested
+              flow: [&inner [*base, third], *inner]
+            copy: *nested
+            YAML);
+
+        $base = ['first', 'second'];
+        $inner = [$base, 'third'];
+        $nested = ['flow' => [$inner, $inner]];
+        self::assertSame([['base' => $base, 'nested' => $nested, 'copy' => $nested]], $documents);
+    }
+
     public function testOnlyTagsInYamlSyntaxAreRefused(): void
     {
         $documents = Yaml::parseDocuments(<<<'YAML'

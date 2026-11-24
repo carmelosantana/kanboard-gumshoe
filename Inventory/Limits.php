@@ -11,6 +11,8 @@ final readonly class Limits
     public const MAX_REPO_LOCKFILES = 50;
     public const MAX_REPO_DEPS = 200_000;
     public const JSON_DEPTH = 64;
+    public const MAX_YAML_REFERENCES = 1_000;
+    public const MAX_YAML_NODES = 500_000;
 
     public function __construct(public int $repoRows = 0)
     {

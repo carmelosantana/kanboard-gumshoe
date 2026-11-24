@@ -91,6 +91,26 @@ final class PnpmLockTest extends TestCase
         self::assertSame([], $result->deps);
     }
 
+    public function testV6NonRegistryKeysUseDeclaredOrOpaqueIdentities(): void
+    {
+        $sha = str_repeat('a', 40);
+        $result = PnpmLock::parse(<<<YAML
+            lockfileVersion: '6.0'
+            packages:
+              github.com/actions/checkout/$sha:
+                name: checkout
+                version: 4.0.0
+                dev: true
+              /example.invalid/is-odd/3.0.1: {}
+            YAML, new Limits());
+
+        self::assertSame('ok', $result->status);
+        self::assertEquals([
+            new Dependency('npm', 'checkout', '4.0.0', 'dev', null, 'none', null),
+            new Dependency('npm', '/example.invalid/is-odd/3.0.1', null, 'prod', null, 'none', null),
+        ], $result->deps);
+    }
+
     public function testUnsupportedDocumentDiscardsAllRows(): void
     {
         $result = PnpmLock::parse($this->fixture('pnpm-lock.v9-v13-multidoc.yaml'), new Limits());

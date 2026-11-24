@@ -8,9 +8,6 @@ use UnexpectedValueException;
 
 final class Yaml
 {
-    private const MAX_REFERENCES = 1_000;
-    private const MAX_NODES = 500_000;
-
     /** @return list<mixed>|ParseResult */
     public static function parseDocuments(string $contents): array|ParseResult
     {
@@ -36,10 +33,12 @@ final class Yaml
     }
 
     private int $referenceCount = 0;
-    private int $remainingNodes = self::MAX_NODES;
+    private int $remainingNodes = Limits::MAX_YAML_NODES;
     private int $nodes = 0;
-    private array $aliases = [];
+    /** @var array<string, int> Expanded sizes, with zero for anchors still open. */
     private array $anchors = [];
+    /** @var list<array{name: string, start: int, indent: int, depth: int, indentless: bool}> */
+    private array $openAnchors = [];
     private ?string $quote = null;
     private int $flowDepth = 0;
     private ?int $blockIndent = null;
@@ -60,6 +59,13 @@ final class Yaml
             $indent = strspn($line, ' ');
             if ($this->inBlockScalar($line, $indent)) {
                 continue;
+            }
+            if ($this->quote === null && $this->flowDepth === 0) {
+                $content = substr($line, $indent);
+                if ($content === '' || $content[0] === '#' || trim($content, " \t") === '') {
+                    continue;
+                }
+                $this->closeBlockAnchors($indent, $content[0] === '-' && str_contains(" \t", $content[1] ?? ' '));
             }
 
             if ($line === '---' && $this->quote === null && $this->flowDepth === 0) {
@@ -109,6 +115,7 @@ final class Yaml
         $quotedKey = false;
         $sequenceIndent = $indent;
         $valueIndent = $indent;
+        $mappingValue = false;
         $i = $indent;
         if (preg_match('/^---[ \t]+/', $line, $marker) === 1) {
             $i = strlen($marker[0]);
@@ -139,7 +146,7 @@ final class Yaml
                 throw new UnexpectedValueException();
             }
             if ($atNode && ($char === '&' || $char === '*')) {
-                $i += $this->scanReference($line, $i, $char);
+                $i += $this->scanReference($line, $i, $valueIndent, $mappingValue);
                 $atNode = $char === '&';
                 continue;
             }
@@ -159,6 +166,7 @@ final class Yaml
             if ($atNode && $this->flowDepth === 0 && ($char === '-' || $char === '?') && str_contains(" \t", $next)) {
                 $valueIndent = $i;
                 $sequenceIndent = $i + 1 + strspn($line, " \t", $i + 1);
+                $mappingValue = false;
                 ++$this->nodes;
                 continue;
             }
@@ -168,6 +176,7 @@ final class Yaml
                 continue;
             }
             if ($this->flowDepth > 0 && ($char === ']' || $char === '}')) {
+                $this->closeFlowAnchors();
                 --$this->flowDepth;
                 $atNode = false;
                 $quotedKey = false;
@@ -176,9 +185,13 @@ final class Yaml
             if (($this->flowDepth > 0 && $char === ',')
                 || ($char === ':' && ($quotedKey || str_contains(" \t", $next)
                     || ($this->flowDepth > 0 && str_contains('[]{},', $next))))) {
+                if ($char === ',') {
+                    $this->closeFlowAnchors();
+                }
                 $atNode = true;
                 $quotedKey = false;
                 $valueIndent = $sequenceIndent;
+                $mappingValue = $char === ':';
                 ++$this->nodes;
                 continue;
             }
@@ -191,50 +204,77 @@ final class Yaml
         }
     }
 
-    private function scanReference(string $line, int $offset, string $indicator): int
+    private function scanReference(string $line, int $offset, int $indent, bool $mappingValue): int
     {
-        if (++$this->referenceCount > self::MAX_REFERENCES) {
+        if (++$this->referenceCount > Limits::MAX_YAML_REFERENCES) {
             throw new UnexpectedValueException();
         }
 
         $delimiters = $this->flowDepth > 0 ? " \t,[]{}" : " \t";
         $length = strcspn($line, $delimiters, $offset + 1);
         $name = substr($line, $offset + 1, $length);
-        ++$this->nodes;
-        if ($indicator === '&') {
-            // A single definition per name keeps alias expansion acyclic.
+        if ($line[$offset] === '&') {
             if (isset($this->anchors[$name])) {
                 throw new UnexpectedValueException();
             }
-            // A simple inline scalar has no descendants to amplify.
-            $tail = $offset + 1 + $length;
-            $this->anchors[$name] = $this->flowDepth === 0
-                && preg_match('/[ \t]+[a-zA-Z0-9][a-zA-Z0-9_.-]*(?:[ \t]+(?:#.*)?)?$/A', $line, $unused, 0, $tail) === 1;
+            $tail = ltrim(substr($line, $offset + 1 + $length), " \t");
+            $this->anchors[$name] = 0;
+            $this->openAnchors[] = [
+                'name' => $name,
+                'start' => $this->nodes,
+                'indent' => $indent,
+                'depth' => $this->flowDepth,
+                'indentless' => $mappingValue && ($tail === '' || $tail[0] === '#'),
+            ];
         } else {
-            $this->aliases[$name] = ($this->aliases[$name] ?? 0) + 1;
+            // Charge the alias as the full target span, including aliases already
+            // charged inside it. An unfinished anchor cannot be an alias target.
+            $size = $this->anchors[$name] ?? 0;
+            if ($size === 0 || $size > $this->remainingNodes - $this->nodes) {
+                throw new UnexpectedValueException();
+            }
+            $this->nodes += $size;
         }
         return $length;
     }
 
+    private function closeBlockAnchors(int $indent, bool $sequenceItem): void
+    {
+        while (($anchor = end($this->openAnchors)) !== false) {
+            if ($indent > $anchor['indent']
+                || ($indent === $anchor['indent'] && $sequenceItem && $anchor['indentless'])) {
+                break;
+            }
+            $this->closeAnchor();
+        }
+    }
+
+    private function closeFlowAnchors(): void
+    {
+        while (($anchor = end($this->openAnchors)) !== false && $anchor['depth'] === $this->flowDepth) {
+            $this->closeAnchor();
+        }
+    }
+
+    private function closeAnchor(): void
+    {
+        $anchor = array_pop($this->openAnchors);
+        if ($this->nodes === $anchor['start']) {
+            ++$this->nodes;
+        }
+        $this->anchors[$anchor['name']] = $this->nodes - $anchor['start'];
+    }
+
     private function chargeDocument(): void
     {
-        // Each original node is copied at most once per path of alias sites leading
-        // to it. On an acyclic path, each name is either absent or used at one of
-        // its sites. Bound the product before handing any references to Symfony.
-        $expanded = $this->nodes;
-        foreach ($this->aliases as $name => $count) {
-            if ($this->anchors[$name] ?? false) {
-                // The lexical budget already counted each alias to this scalar.
-                continue;
-            }
-            if ($expanded > intdiv($this->remainingNodes, 1 + $count)) {
-                throw new UnexpectedValueException();
-            }
-            $expanded *= 1 + $count;
+        while ($this->openAnchors !== []) {
+            $this->closeAnchor();
         }
-        $this->remainingNodes -= $expanded;
+        if ($this->nodes > $this->remainingNodes) {
+            throw new UnexpectedValueException();
+        }
+        $this->remainingNodes -= $this->nodes;
         $this->nodes = 0;
-        $this->aliases = [];
         $this->anchors = [];
     }
 }
