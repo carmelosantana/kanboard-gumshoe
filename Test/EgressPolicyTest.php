@@ -2,6 +2,7 @@
 
 namespace Kanboard\Plugin\Gumshoe\Test;
 
+use Kanboard\Plugin\Gumshoe\Advisory\Osv;
 use Kanboard\Plugin\Gumshoe\Egress\Policy;
 use Kanboard\Plugin\Gumshoe\Http\Client;
 use Kanboard\Plugin\Gumshoe\Http\Request;
@@ -11,12 +12,18 @@ use Kanboard\Plugin\Gumshoe\Inventory\Limits;
 use Kanboard\Plugin\Gumshoe\Inventory\NpmLock;
 use Kanboard\Plugin\Gumshoe\Inventory\PnpmLock;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeTransport;
-use PHPUnit\Framework\TestCase;
+use KanboardTests\units\Base;
+
+use function Kanboard\Plugin\Gumshoe\Schema\version_1;
 
 require_once __DIR__.'/bootstrap.php';
+require_once 'tests/units/Base.php';
+require_once __DIR__.'/ReleasesConnection.php';
 
-final class EgressPolicyTest extends TestCase
+final class EgressPolicyTest extends Base
 {
+    use ReleasesConnection;
+
     private const SHA = '11bd71901bbe5b1630ceea73d27597364c9af683';
 
     /** @dataProvider packageCases */
@@ -36,9 +43,24 @@ final class EgressPolicyTest extends TestCase
 
     public static function packageCases(): iterable
     {
-        yield 'npm scope and maximum version' => ['public', 'npm', '@types/node', 'npmjs', str_repeat('1', 128)];
+        yield 'npm scope and prerelease plus build metadata' => ['public', 'npm', '@types/node', 'npmjs', '22.0.0-rc.1+build.9'];
+        yield 'npm maximum version' => ['public', 'npm', 'lodash', 'npmjs', '4.17.20-'.implode('.', array_fill(0, 19, 'rc'))];
+        yield 'npm version over limit' => ['unqueryable', 'npm', 'lodash', 'npmjs', '4.17.20-'.implode('.', array_fill(0, 19, 'rc')).'1'];
+        yield 'npm incomplete version' => ['unqueryable', 'npm', 'lodash', 'npmjs', '4.17'];
+        yield 'npm version range' => ['unqueryable', 'npm', 'lodash', 'npmjs', '^4.17.20'];
+        yield 'npm embedded credential' => ['unqueryable', 'npm', '@acme/secret-payroll', 'npmjs', 'ghp_'.str_repeat('a', 36)];
+        yield 'npm opaque version segment' => ['unqueryable', 'npm', 'lodash', 'npmjs', '4.17.20+'.str_repeat('a', 32)];
+        yield 'AWS credential in valid semver' => ['unqueryable', 'npm', 'lodash', 'npmjs', '4.17.20+AKIA'.str_repeat('A', 16)];
+        foreach (['ghp_', 'gho_', 'ghu_', 'ghs_', 'ghr_', 'github_pat_', 'glpat-', 'xoxa-', 'xoxb-', 'xoxp-'] as $index => $prefix) {
+            yield 'credential prefix in npm name '.$index => ['unqueryable', 'npm', 'lodash-'.$prefix.'example', 'npmjs'];
+        }
         yield 'npm maximum name' => ['public', 'npm', str_repeat('a', 214), 'npmjs'];
         yield 'composer allows double hyphen in package' => ['public', 'composer', 'symfony/yaml--example', 'packagist', '1.0.0', 'package', [], 'composer'];
+        yield 'composer normalized version' => ['public', 'composer', 'symfony/yaml', 'packagist', '1.2.3.0-RC.2'];
+        yield 'composer pretty version' => ['public', 'composer', 'symfony/yaml', 'packagist', 'v1.2-patch2'];
+        yield 'composer dev branch' => ['unqueryable', 'composer', 'symfony/yaml', 'packagist', 'dev-main'];
+        yield 'composer non-version suffix' => ['unqueryable', 'composer', 'symfony/yaml', 'packagist', '1.2.3-latest'];
+        yield 'composer version over limit' => ['unqueryable', 'composer', 'symfony/yaml', 'packagist', implode('.', array_fill(0, 4, str_repeat('1', 16)))];
         yield 'npm evidence from another lockfile kind' => ['private', 'npm', 'lodash', 'npmjs', '1.0.0', 'package', [], 'yarn'];
         yield 'npm evidence without a lockfile kind' => ['private', 'npm', 'lodash', 'npmjs', '1.0.0', 'package', [], null];
         yield 'missing npm evidence' => ['private', 'npm', 'lodash', null];
@@ -82,6 +104,7 @@ final class EgressPolicyTest extends TestCase
         yield 'unrelated public repo' => ['private', ['actions/setup-node' => true], 'actions/checkout', self::SHA];
         yield 'mutable ref' => ['unqueryable', ['actions/checkout' => true], 'actions/checkout', 'v4', 'none'];
         yield 'invalid commit SHA' => ['unqueryable', ['actions/checkout' => true], 'actions/checkout', str_repeat('z', 40)];
+        yield 'uppercase commit SHA' => ['unqueryable', ['actions/checkout' => true], 'actions/checkout', strtoupper(self::SHA)];
         yield 'invalid repository name' => ['unqueryable', ['actions/..' => true], 'actions/..', self::SHA];
         yield 'action deny prefix' => ['denied', ['actions/checkout' => true], 'actions/checkout', self::SHA, 'commit', ['actions/']];
     }
@@ -146,6 +169,41 @@ final class EgressPolicyTest extends TestCase
         self::assertSame('public', $policy->verdict($recorded));
         self::assertSame('private', $policy->verdict($unknown));
         self::assertSame($requests, $transport->requests);
+    }
+
+    public function testOsvDropsForgedPublicRowsWithoutRecordingCleanResults(): void
+    {
+        $pdo = $this->container['db']->getConnection();
+        require_once __DIR__.'/../Schema/'.ucfirst(DB_DRIVER).'.php';
+        version_1($pdo);
+        $insert = $pdo->prepare(
+            "INSERT INTO gumshoe_pending (run_id, query_type, ecosystem, name, version, egress)
+             VALUES (?, ?, ?, ?, ?, 'public')"
+        );
+        $insert->execute([7, 'package', 'npm', 'lodash', '4.17.20']);
+        $insert->execute([7, 'package', 'npm', '@acme/secret-payroll', 'ghp_'.str_repeat('a', 36)]);
+        $insert->execute([7, 'package', 'composer', 'symfony/yaml', 'dev-main']);
+        $insert->execute([7, 'package', 'npm', 'express', '4.0.0-rc.1+build.2']);
+        $insert->execute([8, 'commit', 'actions', 'actions/checkout', strtoupper(self::SHA)]);
+
+        $transport = new FakeTransport([new Response(200, [], '{"results":[{},{}]}')]);
+        $osv = new Osv(new Client($transport, 'https://kanboard.example'), $pdo);
+        $osv->queryPending(7);
+        self::assertTrue(
+            array_column($transport->requests, 'body') === [
+                '{"queries":[{"package":{"ecosystem":"npm","name":"lodash"},"version":"4.17.20"},'
+                .'{"package":{"ecosystem":"npm","name":"express"},"version":"4.0.0-rc.1+build.2"}]}',
+            ],
+            'Only the two valid public queries may reach the transport.',
+        );
+        self::assertSame([1 => [], 4 => []], $osv->results(7));
+        self::assertNull($osv->queryPending(8));
+        self::assertCount(1, $transport->requests);
+        self::assertSame([], $osv->results(8));
+        self::assertSame(
+            ['public', 'unqueryable', 'unqueryable', 'public', 'unqueryable'],
+            $pdo->query('SELECT egress FROM gumshoe_pending ORDER BY id')->fetchAll(\PDO::FETCH_COLUMN),
+        );
     }
 
     public function testHostileNpmNameIsUnqueryableWithOrWithoutRegistryEvidence(): void

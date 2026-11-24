@@ -3,10 +3,10 @@
 namespace Kanboard\Plugin\Gumshoe\Advisory;
 
 use DateTimeImmutable;
+use Kanboard\Plugin\Gumshoe\Egress\Policy;
 use Kanboard\Plugin\Gumshoe\Http\Client;
 use Kanboard\Plugin\Gumshoe\Http\HttpFailure;
 use Kanboard\Plugin\Gumshoe\Http\Request;
-use Kanboard\Plugin\Gumshoe\Inventory\Dependency;
 use PDO;
 use stdClass;
 
@@ -53,7 +53,7 @@ final class Osv
     public function dueRows(int $runId): array
     {
         $pending = $this->pdo->prepare(
-            "SELECT id, query_type, ecosystem, name, version FROM gumshoe_pending
+            "SELECT id, query_type, ecosystem, name, version, egress FROM gumshoe_pending
              WHERE run_id = ? AND egress = 'public' AND state = 'pending' AND (retry_at IS NULL OR retry_at <= ?)
              ORDER BY id LIMIT ".self::BATCH_SIZE
         );
@@ -108,14 +108,27 @@ final class Osv
     /** Fetch a single batch and its advisory details without touching the database. */
     public function fetch(array $rows, array $cached): array
     {
+        $ids = [];
+        $rejected = [];
+        $queries = [];
+        foreach ($rows as $row) {
+            if (!Policy::allowsPendingQuery($row)) {
+                $rejected[] = $row['id'];
+                continue;
+            }
+            $ids[] = $row['id'];
+            $queries[] = $this->query($row);
+        }
+
         $retryAt = null;
         $records = [];
         $matches = [];
         try {
-            $queries = array_map($this->query(...), $rows);
-            $pages = $this->batch($queries, $retryAt);
-            foreach ($rows as $index => $row) {
-                $matches[$row['id']] = $this->collect($queries[$index], $pages[$index], $retryAt, $cached, $records);
+            if ($queries !== []) {
+                $pages = $this->batch($queries, $retryAt);
+                foreach ($ids as $index => $id) {
+                    $matches[$id] = $this->collect($queries[$index], $pages[$index], $retryAt, $cached, $records);
+                }
             }
         } catch (HttpFailure) {
             $now = ($this->clock)();
@@ -123,12 +136,21 @@ final class Osv
             $matches = [];
         }
 
-        return ['ids' => array_column($rows, 'id'), 'matches' => $matches, 'records' => $records, 'retryAt' => $retryAt];
+        return ['ids' => $ids, 'rejected' => $rejected, 'matches' => $matches, 'records' => $records, 'retryAt' => $retryAt];
     }
 
     /** Publish the batch inside the caller's transaction. */
     public function store(array $batch): void
     {
+        if ($batch['rejected'] !== []) {
+            $reject = $this->pdo->prepare(
+                "UPDATE gumshoe_pending SET egress = 'unqueryable', page_token = NULL, retry_at = NULL
+                 WHERE id = ? AND state = 'pending' AND egress = 'public'"
+            );
+            foreach ($batch['rejected'] as $id) {
+                $reject->execute([$id]);
+            }
+        }
         foreach ($batch['records'] as $id => $record) {
             $this->cache->put('osv', $id, $record, $record['modified'], ($this->clock)());
         }
@@ -150,20 +172,16 @@ final class Osv
 
     private function query(array $row): array
     {
-        if ($row['query_type'] === Dependency::QUERY_COMMIT && $row['ecosystem'] === 'actions'
-            && preg_match('/\A[0-9a-f]{40}\z/i', $row['version']) === 1) {
+        if ($row['ecosystem'] === 'actions') {
             return ['commit' => $row['version']];
         }
-        if ($row['query_type'] === Dependency::QUERY_PACKAGE && in_array($row['ecosystem'], ['npm', 'composer'], true)) {
-            return [
-                'package' => [
-                    'ecosystem' => $row['ecosystem'] === 'composer' ? 'Packagist' : 'npm',
-                    'name' => $row['name'],
-                ],
-                'version' => $row['version'],
-            ];
-        }
-        throw new HttpFailure('osv.querybatch', self::HOST, null, 'invalid_query');
+        return [
+            'package' => [
+                'ecosystem' => $row['ecosystem'] === 'composer' ? 'Packagist' : 'npm',
+                'name' => $row['name'],
+            ],
+            'version' => $row['version'],
+        ];
     }
 
     /** @return list<mixed> Result slots in request order. */
