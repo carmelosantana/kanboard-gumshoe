@@ -94,4 +94,32 @@ final class VaultTokenSourceTest extends TestCase
             self::assertSame($expected, $source->status('symfony')['status']);
         }
     }
+
+    public function testMissingExpiryHeaderPreservesStateAcrossRequestsAndSlices(): void
+    {
+        $vault = new FakeVaultSecrets(static fn () => SecretValue::of('ghp_FAKE_DO_NOT_LEAK'));
+        $source = new VaultTokenSource(['vaultSecrets' => $vault], static fn () => 'vault://17/token');
+        $now = strtotime('2026-11-24 UTC');
+        $expiry = '2026-12-08 00:00:00 UTC';
+        $client = new Client(new FakeTransport([
+            new Response(200, ['github-authentication-token-expiration' => $expiry]),
+            new Response(403),
+            new Response(404),
+            new Response(401),
+        ]), 'https://kanboard.example/', $source, static fn () => $now);
+        $request = new Request('gh.list', 'https://api.github.com/user/repos', 'symfony');
+        $state = ['status' => 'expiring', 'expiresAt' => strtotime($expiry), 'retryAt' => null];
+        $client->send($request);
+        self::assertSame($state, $source->status('symfony'));
+        $client->send($request);
+        self::assertSame($state, $source->status('symfony'));
+        $source->endSlice();
+        self::assertInstanceOf(SecretValue::class, $source->forOwner('symfony'));
+        self::assertSame($state, $source->status('symfony'));
+        $client->send($request);
+        self::assertSame($state, $source->status('symfony'));
+        $client->send($request);
+        $state['status'] = 'expired';
+        self::assertSame($state, $source->status('symfony'));
+    }
 }

@@ -2,7 +2,9 @@
 
 namespace Kanboard\Plugin\Gumshoe\Http;
 
+use Kanboard\Plugin\Gumshoe\Plugin;
 use Kanboard\Plugin\Gumshoe\Secrets\TokenSource;
+use Pimple\Container;
 
 final class Client
 {
@@ -16,17 +18,25 @@ final class Client
         'x-github-api-version' => 'X-GitHub-Api-Version',
     ];
     private const REDIRECTS = [301, 302, 303, 307, 308];
+    private const LIST_QUERY_KEYS = ['page', 'per_page', 'type', 'affiliation', 'sort', 'direction', 'before', 'after', 'since', 'cursor'];
+    private const NUMERIC_LIST_PATH = '~\A/(?:organizations|user)/[0-9]+/repos\z~i';
 
     private array $secondaryLimits = [];
+    /** @var \WeakMap<Request, string|false> Validated next pages and their first-page numeric endpoint, if known. */
+    private readonly \WeakMap $listPages;
     private readonly \Closure $clock;
+    private readonly string $userAgent;
 
     public function __construct(
         private readonly Transport $transport,
-        private readonly string $applicationUrl,
+        string $applicationUrl,
         private readonly ?TokenSource $tokens = null,
         ?\Closure $clock = null,
     ) {
         $this->clock = $clock ?? time(...);
+        $this->listPages = new \WeakMap();
+        $version = (new Plugin(new Container()))->getPluginVersion();
+        $this->userAgent = 'Kanboard-Gumshoe/'.$version.' (+'.$applicationUrl.')';
     }
 
     public function send(#[\SensitiveParameter] Request $request, ?string $jobRef = null): Response
@@ -34,7 +44,7 @@ final class Client
         $operation = $this->operation($request);
         [$url, $host, $path] = $this->target($operation, $request->url);
         $owner = $this->validateRequest($request, $host, $path);
-        $baseHeaders = ['User-Agent' => 'Kanboard-Gumshoe/1.0.0 (+'.$this->applicationUrl.')'];
+        $baseHeaders = ['User-Agent' => $this->userAgent];
         $headers = $baseHeaders;
         foreach ($request->headers as $name => $value) {
             $canonical = self::REQUEST_HEADERS[strtolower((string) $name)] ?? null;
@@ -59,8 +69,15 @@ final class Client
                 $headers['Authorization'] = 'Bearer '.$secret;
             }
 
-            $response = $this->hop($request->withUrl($url), $host, $headers, $secret);
-            unset($headers);
+            try {
+                $response = $this->hop($request->withUrl($url), $host, $headers, $secret);
+            } finally {
+                // Best effort on our copy. PHP or the transport may have made other copies.
+                if (isset($headers['Authorization'])) {
+                    sodium_memzero($headers['Authorization']);
+                }
+                unset($headers);
+            }
             if ($owner !== null) {
                 $this->tokens->observeGithub($owner, $response, $now);
             }
@@ -79,7 +96,6 @@ final class Client
             $retryAt = $this->retryAt($response, $host, $owner, $now);
             return new Response($response->status, $response->headers, $response->body, $retryAt);
         } finally {
-            unset($headers);
             if ($secret !== null) {
                 sodium_memzero($secret);
             }
@@ -96,17 +112,84 @@ final class Client
             if (preg_match('/;[ \t]*rel[ \t]*=[ \t]*(?:"([^"]*)"|([^;\s]+))/i', $parameters, $relation)
                 && in_array('next', preg_split('/\s+/', ($relation[1] ?: $relation[2])), true)) {
                 $operation = $this->operation($request);
-                [, $host, $path] = $this->target($operation, $request->url);
+                [$currentUrl, $host, $path] = $this->target($operation, $request->url);
                 [$url, $nextHost, $nextPath] = $this->target($operation, $url);
-                if ($next !== null || $host !== $nextHost
-                    || ($path !== $nextPath && !str_starts_with($nextPath, rtrim($path, '/').'/'))) {
+                if ($next !== null || $host !== $nextHost) {
                     throw new HttpFailure($operation, $host, $response->status, 'pagination_not_allowed');
                 }
                 $next = $request->withUrl($url);
+                if ($operation === 'gh.list') {
+                    $owner = $this->validateRequest($request, $host, $path);
+                    $numericPath = $this->listPages[$request]
+                        ?? $this->numericListPath($path, parse_url($currentUrl, PHP_URL_QUERY) ?? '', $owner, $response);
+                    if (($nextPath !== $path && $nextPath !== $numericPath)
+                        || !$this->validListQuery(parse_url($url, PHP_URL_QUERY) ?? '')) {
+                        throw new HttpFailure($operation, $host, $response->status, 'pagination_not_allowed');
+                    }
+                    $this->listPages[$next] = $numericPath;
+                } elseif ($path !== $nextPath && !str_starts_with($nextPath, rtrim($path, '/').'/')) {
+                    throw new HttpFailure($operation, $host, $response->status, 'pagination_not_allowed');
+                }
                 $this->validateRequest($next, $nextHost, $nextPath);
             }
         }
         return $next;
+    }
+
+    private function numericListPath(
+        #[\SensitiveParameter] string $path,
+        #[\SensitiveParameter] string $query,
+        ?string $owner,
+        #[\SensitiveParameter] Response $response,
+    ): string|false {
+        if ($owner === null || $response->status !== 200 || !$this->validListQuery($query)) {
+            return false;
+        }
+        parse_str($query, $parameters);
+        if (($parameters['page'] ?? '1') !== '1'
+            || array_intersect_key($parameters, array_flip(['before', 'after', 'since', 'cursor']))) {
+            return false;
+        }
+        $items = json_decode($response->body, true);
+        if (!is_array($items) || !array_is_list($items)) {
+            return false;
+        }
+        $id = null;
+        foreach ($items as $item) {
+            $login = $item['owner']['login'] ?? null;
+            if (!is_string($login) || strcasecmp($login, $owner) !== 0) {
+                continue;
+            }
+            $itemId = $item['owner']['id'] ?? null;
+            if (!is_int($itemId) || $itemId <= 0 || ($id !== null && $itemId !== $id)) {
+                return false;
+            }
+            $id = $itemId;
+        }
+        if ($id === null) {
+            return false;
+        }
+        $prefix = str_starts_with(strtolower($path), '/orgs/') ? '/organizations/' : '/user/';
+        return $prefix.$id.'/repos';
+    }
+
+    private function validListQuery(#[\SensitiveParameter] string $query): bool
+    {
+        if ($query === '') {
+            return true;
+        }
+        if (str_contains($query, ';')) {
+            return false;
+        }
+        $seen = [];
+        foreach (explode('&', $query) as $parameter) {
+            [$key, $value] = array_pad(explode('=', $parameter, 2), 2, null);
+            if ($value === null || isset($seen[$key]) || !in_array($key, self::LIST_QUERY_KEYS, true)) {
+                return false;
+            }
+            $seen[$key] = true;
+        }
+        return true;
     }
 
     private function operation(#[\SensitiveParameter] Request $request): string
@@ -158,6 +241,12 @@ final class Client
             || (!$github && $operation !== 'kev' && $request->method === 'POST'))) {
             throw new HttpFailure($operation, $host, null, 'method_not_allowed');
         }
+        if ($operation === 'gh.list' && preg_match(self::NUMERIC_LIST_PATH, $path) === 1) {
+            if ($request->owner === null || ($this->listPages[$request] ?? false) !== $path) {
+                throw new HttpFailure($operation, $host, null, 'owner_not_allowed');
+            }
+            return strtolower($request->owner);
+        }
         if (!$github || $request->owner === null) {
             return null;
         }
@@ -168,7 +257,7 @@ final class Client
         }
         $repo = '/repos/'.$owner.'/[a-z0-9_.-]+';
         $endpoint = match ($operation) {
-            'gh.list' => '/(?:user/repos|orgs/'.$owner.'/repos)',
+            'gh.list' => '/(?:user/repos|(?:users|orgs)/'.$owner.'/repos)',
             'gh.repo' => $repo,
             'gh.branch' => $repo.'/branches/.+',
             'gh.tree' => $repo.'/git/trees/[a-z0-9]+',

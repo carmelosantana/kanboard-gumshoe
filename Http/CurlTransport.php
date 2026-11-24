@@ -24,15 +24,11 @@ final class CurlTransport implements Transport
         $body = '';
         $reason = null;
         $status = null;
-        $lines = [];
-        foreach ($headers as $name => $value) {
-            $lines[] = $name.': '.$value;
-        }
         $proxy = $this->proxy ?? '';
         $options = [
             CURLOPT_URL => $request->url,
             CURLOPT_CUSTOMREQUEST => $request->method,
-            CURLOPT_HTTPHEADER => $lines,
+            CURLOPT_HTTPHEADER => [],
             CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
             CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
@@ -71,6 +67,9 @@ final class CurlTransport implements Transport
                 return strlen($line);
             },
         ];
+        foreach ($headers as $name => $value) {
+            $options[CURLOPT_HTTPHEADER][] = $name.': '.$value;
+        }
         if ($request->body !== null) {
             $options[CURLOPT_POSTFIELDS] = $request->body;
         }
@@ -90,6 +89,11 @@ final class CurlTransport implements Transport
         } catch (\Throwable) {
             // Adapter errors can contain options or response data.
         } finally {
+            // Best effort on our copies, alongside resetting libcurl's options.
+            foreach ($options[CURLOPT_HTTPHEADER] as &$line) {
+                sodium_memzero($line);
+            }
+            unset($line, $options[CURLOPT_HTTPHEADER]);
             if ($this->handle !== null) {
                 try {
                     $curl('curl_reset', $this->handle);

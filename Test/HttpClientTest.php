@@ -6,12 +6,14 @@ use Kanboard\Plugin\Gumshoe\Http\Client;
 use Kanboard\Plugin\Gumshoe\Http\HttpFailure;
 use Kanboard\Plugin\Gumshoe\Http\Request;
 use Kanboard\Plugin\Gumshoe\Http\Response;
+use Kanboard\Plugin\Gumshoe\Plugin;
 use Kanboard\Plugin\Gumshoe\Secrets\Redactor;
 use Kanboard\Plugin\Gumshoe\Secrets\VaultTokenSource;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeTransport;
 use Kanboard\Plugin\Gumshoe\Test\Fakes\FakeVaultSecrets;
 use Kanboard\Plugin\Vault\Secrets\SecretValue;
 use PHPUnit\Framework\TestCase;
+use Pimple\Container;
 
 final class HttpClientTest extends TestCase
 {
@@ -71,7 +73,8 @@ final class HttpClientTest extends TestCase
         $transport = new FakeTransport([
             static function (#[\SensitiveParameter] array $headers): Response {
                 self::assertTrue(($headers['Authorization'] ?? '') === 'Bearer ghp_FAKE_DO_NOT_LEAK');
-                self::assertSame('Kanboard-Gumshoe/1.0.0 (+https://kanboard.example/)', $headers['User-Agent']);
+                $version = (new Plugin(new Container()))->getPluginVersion();
+                self::assertSame('Kanboard-Gumshoe/'.$version.' (+https://kanboard.example/)', $headers['User-Agent']);
                 return new Response(302, [
                     'Location' => 'https://objects.githubusercontent.com/public-fixture',
                     'github-authentication-token-expiration' => '2026-12-31 00:00:00 UTC',
@@ -99,6 +102,95 @@ final class HttpClientTest extends TestCase
         self::assertCount(5, $transport->requests);
     }
 
+    public function testFollowsRecordedNumericUserLinkWithOriginalOwnerToken(): void
+    {
+        $headers = file_get_contents(__DIR__.'/fixtures/github/repos-list.headers.txt');
+        self::assertSame(1, preg_match('/^link: ([^\r\n]+)/mi', $headers, $link));
+        $page = new Response(200, ['Link' => $link[1]], file_get_contents(__DIR__.'/fixtures/github/repos-list.json'));
+        foreach (['/user/repos', '/users/carmelosantana/repos'] as $path) {
+            $vault = new FakeVaultSecrets(static fn () => SecretValue::of('ghp_FAKE_DO_NOT_LEAK'));
+            $tokens = new VaultTokenSource(['vaultSecrets' => $vault], static fn ($owner) => $owner === 'carmelosantana' ? 'vault://17/token' : null);
+            $transport = new FakeTransport([$page, new Response(200)]);
+            $client = new Client($transport, 'https://kanboard.example/', $tokens);
+            $first = new Request('gh.list', 'https://api.github.com'.$path.'?per_page=5&type=owner', 'CarmeloSantana');
+            $next = $client->nextPage($first, $client->send($first, 'listing'));
+            self::assertNotNull($next);
+            self::assertSame('CarmeloSantana', $next->owner);
+            self::assertSame(200, $client->send($next, 'listing')->status);
+            self::assertSame('https://api.github.com/user/597820/repos?per_page=5&type=owner&page=2', $transport->requests[1]->url);
+            self::assertSame([true, true], $transport->authenticated);
+            self::assertSame([['Gumshoe', 'vault://17/token', 'listing']], $vault->reads);
+        }
+    }
+
+    public function testFollowsNumericOrganizationLinkAndKeepsFirstPageBinding(): void
+    {
+        $endpoint = 'https://api.github.com/organizations/143937/repos';
+        $firstPage = new Response(200, ['Link' => '<'.$endpoint.'?page=2>; rel="next"'],
+            '[{"owner":{"login":"php","id":25158}},{"owner":{"login":"Symfony","id":143937}}]');
+        $secondPage = new Response(200, ['Link' => '<'.$endpoint.'?page=3&after=fixture>; rel="next"'], '[]');
+        $vault = new FakeVaultSecrets(static fn () => SecretValue::of('ghp_FAKE_DO_NOT_LEAK'));
+        $tokens = new VaultTokenSource(['vaultSecrets' => $vault], static fn () => 'vault://17/token');
+        $transport = new FakeTransport([$firstPage, $secondPage, new Response(200)]);
+        $client = new Client($transport, 'https://kanboard.example/', $tokens);
+        $first = new Request('gh.list', 'https://api.github.com/orgs/symfony/repos', 'symfony');
+        $second = $client->nextPage($first, $client->send($first));
+        self::assertNotNull($second);
+        try {
+            $client->send($first->withUrl($second->url));
+            self::fail('Reconstructed a numeric request without validation');
+        } catch (HttpFailure $failure) {
+            self::assertSame('owner_not_allowed', $failure->reason);
+        }
+        $response = $client->send($second);
+        try {
+            $client->nextPage($second, new Response(200, ['Link' => '<https://api.github.com/organizations/25158/repos?page=3>; rel="next"'],
+                '[{"owner":{"login":"symfony","id":25158}}]'));
+            self::fail('Replaced the first-page owner binding');
+        } catch (HttpFailure $failure) {
+            self::assertSame('pagination_not_allowed', $failure->reason);
+        }
+        $third = $client->nextPage($second, $response);
+        self::assertNotNull($third);
+        self::assertSame(200, $client->send($third)->status);
+        self::assertSame([true, true, true], $transport->authenticated);
+        self::assertSame($endpoint.'?page=3&after=fixture', $transport->requests[2]->url);
+    }
+
+    public function testRejectsUnsafeNumericPaginationTargets(): void
+    {
+        $transport = new FakeTransport();
+        $client = new Client($transport, 'https://kanboard.example/');
+        $first = new Request('gh.list', 'https://api.github.com/orgs/symfony/repos', 'symfony');
+        $body = '[{"owner":{"login":"symfony","id":143937}},{"owner":{"login":"php","id":25158}}]';
+        foreach ([
+            'https://api.github.com/organizations/25158/repos?page=2',
+            'https://api.github.com/user/143937/repos?page=2',
+            'https://api.github.com/organizations/143937/repos/other?page=2',
+            'https://api.osv.dev/organizations/143937/repos?page=2',
+            'https://api.github.com/organizations/143937/repos?page=2&access_token=fixture',
+            'https://api.github.com/orgs/symfony/repos?page=2&redirect=fixture',
+        ] as $url) {
+            try {
+                $client->nextPage($first, new Response(200, ['Link' => '<'.$url.'>; rel="next"'], $body));
+                self::fail('Invalid pagination target accepted');
+            } catch (HttpFailure $failure) {
+                self::assertSame('pagination_not_allowed', $failure->reason);
+            }
+        }
+        self::assertSame([], $transport->requests);
+    }
+
+    public function testAStandaloneLaterPageCannotEstablishNumericOwnerBinding(): void
+    {
+        $first = new Request('gh.list', 'https://api.github.com/orgs/symfony/repos?page=2', 'symfony');
+        $response = new Response(200, ['Link' => '<https://api.github.com/organizations/143937/repos?page=3>; rel="next"'],
+            '[{"owner":{"login":"symfony","id":143937}}]');
+        $client = new Client(new FakeTransport(), 'https://kanboard.example/');
+        $this->expectExceptionMessage('pagination_not_allowed');
+        $client->nextPage($first, $response);
+    }
+
     public function testBlocksCallerCredentialsAndUnboundAuthenticatedListings(): void
     {
         $vault = new FakeVaultSecrets(static fn () => SecretValue::of('ghp_FAKE_DO_NOT_LEAK'));
@@ -108,7 +200,8 @@ final class HttpClientTest extends TestCase
 
         foreach ([
             [new Request('osv.query', 'https://api.osv.dev/v1/query', headers: ['authorization' => 'Bearer fixture']), 'header_not_allowed'],
-            [new Request('gh.list', 'https://api.github.com/user/123/repos', 'symfony'), 'owner_not_allowed'],
+            [new Request('gh.list', 'https://api.github.com/user/597820/repos?page=2', 'carmelosantana'), 'owner_not_allowed'],
+            [new Request('gh.list', 'https://api.github.com/users/php/repos', 'symfony'), 'owner_not_allowed'],
         ] as [$request, $reason]) {
             try {
                 $client->send($request);

@@ -53,7 +53,9 @@ final class VaultTokenSource implements TokenSource
                 $this->setStatus($owner, 'refused:server_off');
             } else {
                 $this->slice[$owner] = $this->container['vaultSecrets']->read('Gumshoe', $ref, $jobRef);
-                $this->setStatus($owner, 'unknown');
+                if (!in_array($this->status($owner)['status'], ['ok', 'expiring', 'expired'], true)) {
+                    $this->setStatus($owner, 'unknown');
+                }
             }
         } catch (ServiceSecretException $refusal) {
             $reason = $refusal->reason();
@@ -72,7 +74,13 @@ final class VaultTokenSource implements TokenSource
     public function observeGithub(string $owner, #[\SensitiveParameter] Response $response, int $now): void
     {
         $owner = strtolower($owner);
-        $header = $response->header('github-authentication-token-expiration') ?? '';
+        $header = $response->header('github-authentication-token-expiration');
+        if ($header === null) {
+            if ($response->status === 401) {
+                $this->setStatus($owner, 'expired', $this->status($owner)['expiresAt']);
+            }
+            return;
+        }
         $expiresAt = null;
         if (preg_match('/\A\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (?:UTC|[+-]\d{4})\z/', $header) === 1) {
             $expiresAt = strtotime($header) ?: null;
