@@ -3,6 +3,7 @@
 namespace Kanboard\Plugin\Gumshoe;
 
 use Kanboard\Core\Plugin\Base;
+use Kanboard\Core\Security\Role;
 use Kanboard\Plugin\Gumshoe\Console\ScanCommand;
 use Kanboard\Plugin\Gumshoe\Run\Jobs;
 use Kanboard\Plugin\Gumshoe\Run\Scanner;
@@ -19,6 +20,16 @@ class Plugin extends Base
         $container['gumshoeVisitTrigger'] ??= static fn ($c) => new VisitTrigger($c);
         $container['cli']->add(new ScanCommand($container));
 
+        $actions = [
+            'index' => '', 'review' => '/review', 'save' => '/save',
+            'owner' => '/owner', 'importPins' => '/import-pins',
+        ];
+        $this->applicationAccessMap->add('SourcesController', array_keys($actions), Role::APP_ADMIN);
+        foreach ($actions as $action => $path) {
+            $this->route->addRoute('settings/gumshoe/sources'.$path, 'SourcesController', $action, 'Gumshoe');
+        }
+        $this->hook->on('template:config:sidebar', ['template' => 'Gumshoe:config/sidebar']);
+
         $this->hook->on('foreman:jobs', static function () use ($container): array {
             $jobs = (new Jobs($container['gumshoeScanner']))->descriptors();
             foreach ($jobs as &$job) {
@@ -33,6 +44,15 @@ class Plugin extends Base
                 return [];
             },
         ]);
+    }
+
+    public function onStartup(): void
+    {
+        if (strcasecmp($this->router->getPlugin(), 'Gumshoe') === 0
+            && strcasecmp($this->router->getController(), 'SourcesController') === 0) {
+            $this->hook->on('template:layout:css', ['template' => 'plugins/Gumshoe/Assets/css/gumshoe.css']);
+            $this->hook->on('template:layout:js', ['template' => 'plugins/Gumshoe/Assets/js/gumshoe.js']);
+        }
     }
 
     public function getPluginName(): string
