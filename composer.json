@@ -1,0 +1,15 @@
+{
+    "name": "carmelosantana/kanboard-gumshoe",
+    "description": "Kanboard plugin: dependency vulnerability and malware watch for GitHub repos",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.4"
+    },
+    "config": {
+        "platform": { "php": "8.4.0" },
+        "allow-plugins": false,
+        "sort-packages": true,
+        "optimize-autoloader": true
+    }
+}
