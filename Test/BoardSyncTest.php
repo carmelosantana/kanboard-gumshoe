@@ -162,6 +162,13 @@ final class BoardSyncTest extends Base
         self::assertGreaterThan(0, (int) $this->finding()['reopened_by_person_at']);
         self::assertSame(['Fixed in symfony/yaml.', 'Fixed in all repos.'], $this->comments($id));
 
+        $reopened = $this->finding()['reopened_by_person_at'];
+        $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 1');
+        $this->sync();
+        self::assertTrue($this->container['taskStatusModel']->isOpen($id));
+        self::assertSame($reopened, $this->finding()['reopened_by_person_at']);
+        self::assertCount(2, $this->comments($id));
+
         $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'affected'");
         $this->sync();
         self::assertSame('open', $this->finding()['status']);
@@ -284,51 +291,202 @@ final class BoardSyncTest extends Base
         self::assertSame([], $this->comments($id));
     }
 
-    public static function mergeEscalations(): array
+    public function testMergeKeepsOpenAbsorbedTaskWhenSurvivorWasClosedByPerson(): void
     {
-        return [
-            'alias merge alone' => [null, false],
-            'higher priority carried by the merge' => ['before', false],
-            'higher priority with no snapshot' => ['after', true],
-        ];
+        $this->addMergeFinding();
+        $this->sync();
+        $this->sync(2);
+        $old = (int) $this->finding()['task_id'];
+        $absorbed = (int) $this->finding(2)['task_id'];
+        self::assertTrue($this->container['taskStatusModel']->close($old));
+        $this->sync();
+        $closedAt = $this->container['taskFinderModel']->getById($old)['date_completed'];
+        $this->mergeInto(1, 2);
+
+        $this->sync(2);
+        $this->sync();
+        $this->sync(2);
+        self::assertSame($absorbed, (int) $this->finding()['task_id']);
+        self::assertSame('open', $this->finding()['status']);
+        self::assertNull($this->finding()['closed_by_gumshoe_at']);
+        $kept = $this->container['taskFinderModel']->getById($absorbed);
+        self::assertSame('gumshoe:finding:1', $kept['reference']);
+        self::assertSame('[Gumshoe] flatmap-stream — CVE-2018-16492 (2 repos)', $kept['title']);
+        self::assertTrue($this->container['taskStatusModel']->isOpen($absorbed));
+        self::assertSame([], $this->comments($absorbed));
+        self::assertSame(["Merged into #$absorbed."], $this->comments($old));
+        self::assertTrue($this->container['taskStatusModel']->isClosed($old));
+        self::assertSame($closedAt, $this->container['taskFinderModel']->getById($old)['date_completed']);
+        self::assertSame([SubtaskModel::STATUS_TODO, SubtaskModel::STATUS_TODO], $this->subtaskStatuses($absorbed));
     }
 
-    /** @dataProvider mergeEscalations */
-    public function testMergeWithExistingTaskOnlyReopensForEscalation(?string $priorityChange, bool $missingSnapshot): void
+    public function testFreshSurvivorAdoptsActiveTaskAheadOfEarlierClosedTask(): void
     {
-        $this->pdo->exec(<<<'SQL'
-            INSERT INTO gumshoe_findings (group_id, ecosystem, package) VALUES (2, 'npm', 'flatmap-stream');
-            INSERT INTO gumshoe_finding_repos (finding_id, repo_id, state, ever_affected) VALUES (2, 2, 'affected', 1)
-            SQL);
-        if ($priorityChange === 'before') {
-            $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 2');
-        }
+        $this->addMergeFinding();
+        $this->pdo->exec("INSERT INTO gumshoe_groups (id, primary_id) VALUES (3, 'CVE-2021-44228')");
         $this->sync();
         $this->sync(2);
-        $survivor = (int) $this->finding()['task_id'];
-        $absorbed = (int) $this->finding(2)['task_id'];
-        $this->container['taskStatusModel']->close($survivor);
+        $closed = (int) $this->finding()['task_id'];
+        $active = (int) $this->finding(2)['task_id'];
+        self::assertTrue($this->container['taskStatusModel']->close($closed));
         $this->sync();
-        $this->pdo->exec('UPDATE gumshoe_groups SET merged_into = 1 WHERE id = 2');
-        (new FindingModel($this->pdo))->mergeAbsorbedFindings();
-        if ($priorityChange !== null) {
-            $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 1');
-        }
-        if ($missingSnapshot) {
-            $this->pdo->exec('UPDATE gumshoe_findings SET observed_status = NULL, observed_priority = NULL,
-                observed_kev = NULL, observed_malware = NULL WHERE id = 1');
-        }
-        $escalates = $priorityChange !== null;
+
+        $merged = $this->mergeInto(3, 1, 2);
+        $survivor = $merged[1]['survivor_finding_id'];
+        $this->sync();
+        $this->sync($survivor);
+        $this->sync(2);
+
+        self::assertSame($active, (int) $this->finding($survivor)['task_id']);
+        self::assertSame('open', $this->finding($survivor)['status']);
+        self::assertTrue($this->container['taskStatusModel']->isOpen($active));
+        self::assertSame([], $this->comments($active));
+        self::assertTrue($this->container['taskStatusModel']->isClosed($closed));
+        self::assertSame(["Merged into #$active."], $this->comments($closed));
+    }
+
+    public function testDeletedSurvivorDoesNotAdoptClosedAbsorbedTask(): void
+    {
+        $this->addMergeFinding();
+        $this->sync();
+        $this->sync(2);
+        $deleted = (int) $this->finding()['task_id'];
+        $closed = (int) $this->finding(2)['task_id'];
+        self::assertTrue($this->container['taskModel']->remove($deleted));
+        self::assertTrue($this->container['taskStatusModel']->close($closed));
+        $this->sync();
+        // Merge before Gumshoe has seen the absorbed task close.
+        $this->mergeInto(1, 2);
 
         $this->sync(2);
+        $this->sync();
+        self::assertNull($this->finding()['task_id']);
+        self::assertSame('dismissed', $this->finding()['status']);
+        self::assertSame('gumshoe:finding:2', $this->container['taskFinderModel']->getById($closed)['reference']);
+        self::assertTrue($this->container['taskStatusModel']->isClosed($closed));
+    }
+
+    public function testMergeKeepsFixedTaskClosedWhenAbsorbedTaskWasJustDismissed(): void
+    {
+        $this->addMergeFinding();
+        $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 2');
+        $this->sync();
         $this->sync(2);
-        self::assertTrue($this->container['taskStatusModel']->isClosed($absorbed));
-        self::assertSame(["Merged into #$survivor."], $this->comments($absorbed));
-        self::assertSame($escalates, $this->container['taskStatusModel']->isOpen($survivor));
-        self::assertSame($escalates ? 'open' : 'dismissed', $this->finding()['status']);
-        self::assertSame($escalates ? ['Reopened: priority rose to high.'] : [], $this->comments($survivor));
-        self::assertSame(array_fill(0, 2, $escalates ? SubtaskModel::STATUS_TODO : SubtaskModel::STATUS_DONE),
-            $this->subtaskStatuses($survivor));
+        $fixed = (int) $this->finding()['task_id'];
+        $closed = (int) $this->finding(2)['task_id'];
+        $this->pdo->exec("UPDATE gumshoe_finding_repos SET state = 'fixed' WHERE finding_id = 1");
+        $this->sync();
+        self::assertTrue($this->container['taskStatusModel']->close($closed));
+
+        $this->mergeInto(1, 2);
+        $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 1');
+        $this->sync();
+        $this->sync();
+        self::assertSame($fixed, (int) $this->finding()['task_id']);
+        self::assertSame('dismissed', $this->finding()['status']);
+        self::assertTrue($this->container['taskStatusModel']->isClosed($fixed));
+        self::assertTrue($this->container['taskStatusModel']->isClosed($closed));
+        self::assertSame(['Fixed in symfony/yaml.', 'Fixed in all repos.'], $this->comments($fixed));
+        self::assertSame(["Merged into #$fixed."], $this->comments($closed));
+    }
+
+    public function testFreshSurvivorSkipsPreviouslyMergedClosedTaskAfterIntermediateDeletion(): void
+    {
+        $this->addMergeFinding();
+        $this->pdo->exec("INSERT INTO gumshoe_groups (id, primary_id) VALUES (3, 'CVE-2021-44228')");
+        $this->sync();
+        $this->sync(2);
+        $original = (int) $this->finding()['task_id'];
+        $intermediate = (int) $this->finding(2)['task_id'];
+        $this->mergeInto(2, 1);
+        $this->sync();
+        self::assertSame(["Merged into #$intermediate."], $this->comments($original));
+        self::assertTrue($this->container['taskModel']->remove($intermediate));
+        $this->sync(2);
+        $survivor = $this->mergeInto(3, 2)[2]['survivor_finding_id'];
+
+        $this->sync($survivor);
+        self::assertNull($this->finding($survivor)['task_id']);
+        self::assertSame('dismissed', $this->finding($survivor)['status']);
+        self::assertSame('gumshoe:finding:1', $this->container['taskFinderModel']->getById($original)['reference']);
+        self::assertSame(["Merged into #$intermediate."], $this->comments($original));
+    }
+
+    public function testCyclicReverseMergeChainTerminates(): void
+    {
+        $this->addMergeFinding();
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        self::assertTrue($this->container['taskStatusModel']->close($id));
+        $this->pdo->exec(<<<'SQL'
+            UPDATE gumshoe_groups SET merged_into = CASE id WHEN 1 THEN 2 ELSE 1 END;
+            UPDATE gumshoe_findings SET status = 'merged' WHERE id = 2
+            SQL);
+
+        $this->sync();
+        self::assertSame('dismissed', $this->finding()['status']);
+        self::assertTrue($this->container['taskStatusModel']->isClosed($id));
+    }
+
+    public function testInterruptedRecreationSkipsOldClosedSurvivorWithSameReference(): void
+    {
+        $this->addMergeFinding();
+        $this->sync();
+        $this->sync(2);
+        $old = (int) $this->finding()['task_id'];
+        self::assertTrue($this->container['taskStatusModel']->close($old));
+        $this->mergeInto(1, 2);
+        $this->sync();
+        $adopted = (int) $this->finding()['task_id'];
+        self::assertNotSame($old, $adopted);
+        self::assertTrue($this->container['taskModel']->remove($adopted));
+        $this->sync();
+
+        $interrupt = true;
+        $this->container['hook']->on('model:task:creation:aftersave', static function () use (&$interrupt) {
+            if ($interrupt) {
+                throw new RuntimeException('Recreation interrupted');
+            }
+        });
+        $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 1');
+        $this->assertInterrupted('Recreation interrupted');
+        $interrupt = false;
+        $this->sync();
+
+        $recreated = (int) $this->finding()['task_id'];
+        self::assertNotSame($old, $recreated);
+        self::assertTrue($this->container['taskStatusModel']->isOpen($recreated));
+        self::assertTrue($this->container['taskStatusModel']->isClosed($old));
+        self::assertSame(["Merged into #$adopted."], $this->comments($old));
+        self::assertSame(2, $this->container['taskFinderModel']->countByProjectId($this->project));
+    }
+
+    public function testPersonClosedTaskKeepsItsTitle(): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        self::assertTrue($this->container['taskStatusModel']->close($id));
+        $title = $this->container['taskFinderModel']->getById($id)['title'];
+        $this->pdo->exec("UPDATE gumshoe_groups SET primary_id = 'CVE-2021-44228' WHERE id = 1");
+
+        $this->sync();
+        self::assertSame('dismissed', $this->finding()['status']);
+        self::assertSame($title, $this->container['taskFinderModel']->getById($id)['title']);
+    }
+
+    public function testEscalationDoesNotAnnounceReopenWhenPersonAlreadyOpenedTask(): void
+    {
+        $this->sync();
+        $id = (int) $this->finding()['task_id'];
+        self::assertTrue($this->container['taskStatusModel']->close($id));
+        $this->sync();
+        self::assertTrue($this->container['taskStatusModel']->open($id));
+        $this->pdo->exec('UPDATE gumshoe_groups SET cvss_max = 8 WHERE id = 1');
+
+        $this->sync();
+        self::assertSame('open', $this->finding()['status']);
+        self::assertSame([], $this->comments($id));
+        self::assertSame([SubtaskModel::STATUS_TODO], $this->subtaskStatuses($id));
     }
 
     public static function adoptionCases(): array
@@ -459,7 +617,7 @@ final class BoardSyncTest extends Base
         $this->sync();
         self::assertSame('open', $this->finding()['status']);
         self::assertTrue($this->container['taskStatusModel']->isOpen((int) $this->finding()['task_id']));
-        self::assertSame(['Reopened: now known malware.'], $this->comments((int) $this->finding()['task_id']));
+        self::assertSame([], $this->comments((int) $this->finding()['task_id']));
     }
 
     public function testPublicOrMissingTargetRecordsUnavailableWithoutWritingTasks(): void
@@ -506,6 +664,22 @@ final class BoardSyncTest extends Base
         self::assertSame(1, $counts['project_unavailable']);
         self::assertSame('The findings board is public; Gumshoe will not write private repo names to it.',
             $counts['project_unavailable_message'] ?? null);
+    }
+
+    private function addMergeFinding(): void
+    {
+        $this->pdo->exec(<<<'SQL'
+            INSERT INTO gumshoe_findings (group_id, ecosystem, package) VALUES (2, 'npm', 'flatmap-stream');
+            INSERT INTO gumshoe_finding_repos (finding_id, repo_id, state, ever_affected) VALUES (2, 2, 'affected', 1)
+            SQL);
+    }
+
+    private function mergeInto(int $survivor, int ...$absorbed): array
+    {
+        $groups = implode(', ', $absorbed);
+        $this->pdo->exec("UPDATE gumshoe_groups SET merged_into = $survivor WHERE id IN ($groups)");
+
+        return (new FindingModel($this->pdo))->mergeAbsorbedFindings();
     }
 
     private function addRepo(): void

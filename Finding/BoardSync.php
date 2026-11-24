@@ -14,6 +14,8 @@ use Throwable;
 
 final class BoardSync extends Base
 {
+    private const MERGED_COMMENT_PATTERN = 'Merged into #%.';
+
     public const PUBLIC_BOARD_MESSAGE = 'The findings board is public; Gumshoe will not write private repo names to it.';
 
     /**
@@ -41,18 +43,16 @@ final class BoardSync extends Base
 
         $reference = 'gumshoe:finding:'.$findingId;
         $task = $this->findTask($finding);
-        if ($finding['task_id'] === null) {
-            $adoption = $this->adoptAbsorbedTask($finding, $targetProject, $reference);
-            if (isset($adoption['unavailable'])) {
-                return $this->unavailable($runId, $targetProject, $adoption['unavailable']);
+        $absorbed = $this->absorbedFindings($finding);
+        if ($absorbed !== []) {
+            $merge = $this->mergeBoardTasks($finding, $task, $absorbed, $targetProject, $reference);
+            if (isset($merge['unavailable'])) {
+                return $this->unavailable($runId, $targetProject, $merge['unavailable']);
             }
-            if (isset($adoption['retry'])) {
+            if (isset($merge['retry'])) {
                 return null;
             }
-            if ($adoption !== []) {
-                $task = $adoption['task'];
-                $finding = $adoption['finding'];
-            }
+            [$finding, $task] = $merge;
         }
 
         $previousProject = (int) $finding['project_id'];
@@ -70,16 +70,18 @@ final class BoardSync extends Base
             $closeTime = null;
             $this->sql("UPDATE gumshoe_findings SET status = 'dismissed', task_id = NULL, closed_by_gumshoe_at = NULL WHERE id = ?", [$findingId]);
             $finding['task_id'] = null;
-        } elseif ($task !== [] && !$active && ((int) $task['date_completed'] > (int) $closeTime || $personReopened !== null)) {
+        } elseif ($task === [] && $finding['task_id'] === null && $previousProject > 0) {
             $status = 'dismissed';
-        } elseif ($active && $status === 'fixed' && $closeTime !== null) {
+        } elseif ($task !== [] && !$active && $this->wasClosedByPerson($finding, $task)) {
+            $status = 'dismissed';
+        } elseif ($active && $closeTime !== null) {
             $personReopened ??= time();
         }
 
-        $reason = ($status === 'dismissed' || $personReopened !== null)
-            ? $this->escalation($finding, $priority, $affected, $repoTransitions)
+        $reason = $status === 'dismissed'
+            ? $this->escalation($finding, $priority, $affected, $repoTransitions, $absorbed)
             : null;
-        if ($affected !== [] || $reason !== null) {
+        if ($affected !== []) {
             $personReopened = null;
         }
         $reopen = $affected !== [] && (
@@ -154,10 +156,8 @@ final class BoardSync extends Base
                 return ['interrupted' => $error];
             }
 
-            if ($reopen) {
-                if (!$active) {
-                    $this->check($this->taskStatusModel->open($taskId), 'open task');
-                }
+            if ($reopen && !$active) {
+                $this->check($this->taskStatusModel->open($taskId), 'open task');
                 if ($reason !== null) {
                     $this->comment($taskId, "Reopened: $reason.");
                 }
@@ -168,7 +168,7 @@ final class BoardSync extends Base
                 $closeTime = null;
             }
 
-            $changes = $status === 'dismissed' ? array_intersect_key($values, ['title' => true]) : $values;
+            $changes = $status === 'dismissed' && !$active ? [] : $values;
             if (array_diff_assoc($changes, array_intersect_key($task, $changes)) !== []) {
                 $this->check($this->taskModificationModel->update(['id' => $taskId] + $changes), 'update task');
             }
@@ -199,10 +199,28 @@ final class BoardSync extends Base
             return ($task['reference'] ?? null) === $reference ? $task : [];
         }
         if ($finding['task_id'] !== null && (int) $finding['project_id'] > 0) {
-            return $this->taskFinderModel->getByReference((int) $finding['project_id'], $reference) ?: [];
+            // A person can move an interrupted create before recovery. This
+            // project-scoped lookup accepts a duplicate in that window.
+            return $this->recoverTask((int) $finding['project_id'], $reference);
         }
 
         return [];
+    }
+
+    private function recoverTask(int $project, string $reference): array
+    {
+        $task = $this->taskFinderModel->getByReference($project, $reference) ?: [];
+        if ($task === [] || !$this->hasMergeComment((int) $task['id'])) {
+            return $task;
+        }
+
+        // A replaced closed task keeps its original reference and history.
+        return $this->sql(
+            "SELECT t.* FROM tasks t WHERE t.project_id = ? AND t.reference = ?
+             AND NOT EXISTS (SELECT 1 FROM comments c WHERE c.task_id = t.id AND c.user_id = 0 AND c.comment LIKE ?)
+             ORDER BY t.id DESC LIMIT 1",
+            [$project, $reference, self::MERGED_COMMENT_PATTERN],
+        )->fetch(PDO::FETCH_ASSOC) ?: [];
     }
 
     private function createTask(array $finding, int $target, int $project, string $reference, array $values): array
@@ -225,7 +243,7 @@ final class BoardSync extends Base
                 $id = $this->taskCreationModel->create($values + ['project_id' => $project, 'reference' => $reference]);
                 $this->check($id > 0, 'create task');
             } catch (Throwable $error) {
-                if (!$this->taskFinderModel->getByReference($project, $reference)) {
+                if ($this->recoverTask($project, $reference) === []) {
                     throw $error;
                 }
 
@@ -251,7 +269,7 @@ final class BoardSync extends Base
         return array_column($rows, null, 'repo_id');
     }
 
-    private function escalation(array $finding, string $priority, array $affected, array $transitions): ?string
+    private function escalation(array $finding, string $priority, array $affected, array $transitions, array $absorbed): ?string
     {
         if ($finding['last_synced_at'] === null) {
             return null;
@@ -261,10 +279,9 @@ final class BoardSync extends Base
         $previousPriority = $rank[$finding['observed_priority'] ?? $finding['priority']];
         $knownMalware = !empty($finding['observed_malware']);
         $knownKev = !empty($finding['observed_kev']);
-        // Known severity from another dismissed finding was already accepted.
-        // An open absorbed finding can still raise the survivor's severity.
-        foreach ($this->absorbedFindings($finding) as $other) {
-            if ($other['last_synced_at'] === null || $other['observed_status'] === 'open') {
+        // Severity already observed on either side of a merge is old evidence.
+        foreach ($absorbed as $other) {
+            if ($other['last_synced_at'] === null) {
                 continue;
             }
             $knownMalware = $knownMalware || !empty($other['observed_malware']);
@@ -294,12 +311,12 @@ final class BoardSync extends Base
     private function absorbedFindings(array $finding): array
     {
         return $this->sql(
-            "WITH RECURSIVE absorbed(id, depth) AS (
-                 SELECT id, 1 FROM gumshoe_groups WHERE merged_into = ?
-                 UNION ALL SELECT g.id, a.depth + 1 FROM gumshoe_groups g JOIN absorbed a ON a.id = g.merged_into
+            "WITH RECURSIVE absorbed(id) AS (
+                 SELECT id FROM gumshoe_groups WHERE merged_into = ?
+                 UNION SELECT g.id FROM gumshoe_groups g JOIN absorbed a ON a.id = g.merged_into
              )
              SELECT f.* FROM gumshoe_findings f JOIN absorbed a ON a.id = f.group_id
-             WHERE f.ecosystem = ? AND f.package = ? AND f.status = 'merged' ORDER BY a.depth, f.id",
+             WHERE f.ecosystem = ? AND f.package = ? AND f.status = 'merged' ORDER BY f.id",
             [$finding['group_id'], $finding['ecosystem'], $finding['package']],
         )->fetchAll(PDO::FETCH_ASSOC);
     }
@@ -400,117 +417,163 @@ final class BoardSync extends Base
         return TaskText::description($summary, $ids, $exposures, (bool) $finding['malware'], (bool) $finding['kev']);
     }
 
-    private function adoptAbsorbedTask(array $finding, int $targetProject, string $reference): array
+    private function wasClosedByPerson(array $finding, array $task): bool
     {
-        foreach ($this->absorbedFindings($finding) as $absorbed) {
-            $task = $this->findTask($absorbed);
-            if ($task === []) {
-                continue;
-            }
-
-            $project = (int) $task['project_id'];
-            return (new FindingModel($this->db->getConnection()))->transaction(function () use (
-                $finding, $absorbed, $task, $project, $targetProject, $reference,
-            ): array {
-                if (!$this->lockPrivateProjects($targetProject, $project)) {
-                    return ['unavailable' => $project];
-                }
-                if (!$this->lockTask($task)) {
-                    return ['retry' => true];
-                }
-
-                $id = (int) $task['id'];
-                $claim = $this->sql(
-                    'UPDATE gumshoe_findings SET task_id = ?, project_id = ?, closed_by_gumshoe_at = ?,
-                     reopened_by_person_at = ?, last_synced_at = ?, observed_priority = ?, observed_malware = ?, observed_kev = ?, observed_status = ?
-                     WHERE id = ? AND task_id IS NULL',
-                    [
-                        $id, $project, $absorbed['closed_by_gumshoe_at'], $absorbed['reopened_by_person_at'],
-                        $finding['last_synced_at'] ?? $absorbed['last_synced_at'],
-                        $finding['observed_priority'] ?? $absorbed['observed_priority'],
-                        $finding['observed_malware'] ?? $absorbed['observed_malware'],
-                        $finding['observed_kev'] ?? $absorbed['observed_kev'],
-                        $finding['observed_status'] ?? $absorbed['observed_status'], $finding['id'],
-                    ],
-                );
-                $this->check($claim->rowCount() === 1, 'claim absorbed task');
-
-                $affected = count(array_filter($this->repos((int) $finding['id']), static fn (array $repo): bool => $repo['state'] === 'affected'));
-                if ($affected === 0 && preg_match('/\(([1-9][0-9]*) repos?\)$/D', $task['title'], $match)) {
-                    $affected = (int) $match[1];
-                }
-                $title = TaskText::title($finding['package'], $finding['primary_id'], max(1, $affected));
-                $this->check($this->taskModificationModel->update([
-                    'id' => $id, 'reference' => $reference, 'title' => $title,
-                ]), 'adopt absorbed task');
-                $this->sql('UPDATE gumshoe_findings SET task_id = NULL WHERE id = ?', [$absorbed['id']]);
-
-                $updated = $this->sql('SELECT * FROM gumshoe_findings WHERE id = ?', [$finding['id']])->fetch(PDO::FETCH_ASSOC);
-
-                return [
-                    'finding' => $updated + $finding,
-                    'task' => ['reference' => $reference, 'title' => $title] + $task,
-                ];
-            });
-        }
-
-        return [];
+        return (int) $task['date_completed'] > (int) $finding['closed_by_gumshoe_at']
+            || $finding['reopened_by_person_at'] !== null;
     }
 
-    private function syncMerged(array $finding, int $targetProject, int $runId): ?string
+    private function mergeBoardTasks(array $finding, array $kept, array $absorbed, int $target, string $reference): array
     {
-        $task = $this->findTask($finding);
-        if ($task !== [] && $this->privateProject((int) $task['project_id']) === []) {
-            return $this->unavailable($runId, (int) $task['project_id']);
-        }
-        $group = (int) $finding['merged_into'];
-        $seen = [(int) $finding['group_id'] => true];
-        while ($group > 0 && !isset($seen[$group])) {
-            $seen[$group] = true;
-            $next = $this->sql('SELECT merged_into FROM gumshoe_groups WHERE id = ?', [$group])->fetchColumn();
-            if ($next === null) {
-                break;
+        $active = [];
+        $closed = [];
+        foreach ($absorbed as $other) {
+            $task = $this->findTask($other);
+            if (!empty($task['is_active'])) {
+                $active[] = [$other, $task];
+            } elseif ($task !== [] && !$this->hasMergeComment((int) $task['id'])) {
+                $closed[] = [$other, $task];
             }
-            $group = (int) $next;
-        }
-        $survivor = (int) $this->sql("SELECT id FROM gumshoe_findings WHERE group_id = ? AND ecosystem = ? AND package = ? AND status <> 'merged'",
-            [$group, $finding['ecosystem'], $finding['package']])->fetchColumn();
-        $this->check($survivor > 0, 'find merge survivor');
-
-        $problem = $this->sync($survivor, $targetProject, $runId);
-        if ($problem !== null) {
-            return $problem;
         }
 
-        // Sync may have transferred ownership to the survivor.
-        $task = $this->findTask($finding);
-        $survivorTask = (int) $this->sql('SELECT task_id FROM gumshoe_findings WHERE id = ?', [$survivor])->fetchColumn();
-        if ($task === [] || $survivorTask === 0) {
-            return null;
-        }
-
-        $result = (new FindingModel($this->db->getConnection()))->transaction(function () use ($task, $targetProject, $survivorTask, $finding): array {
-            if (!$this->lockPrivateProjects($targetProject, (int) $task['project_id'])) {
-                return ['unavailable' => (int) $task['project_id']];
+        foreach (array_merge($active, $closed) as [$other, $task]) {
+            $adopt = !empty($task['is_active'])
+                ? empty($kept['is_active'])
+                : $kept === [] && $finding['task_id'] === null && $finding['project_id'] === null;
+            if ($adopt) {
+                $result = $this->adoptAbsorbedTask($finding, $kept, $other, $task, $target, $reference);
+                if (isset($result['unavailable']) || isset($result['retry'])) {
+                    return $result;
+                }
+                [$finding, $kept] = $result;
+            } elseif ($kept !== []) {
+                $status = 'open';
+                if (empty($kept['is_active'])) {
+                    $status = $finding['status'] === 'dismissed' || $other['observed_status'] === 'dismissed'
+                        || $this->wasClosedByPerson($finding, $kept) || $this->wasClosedByPerson($other, $task)
+                        ? 'dismissed' : 'fixed';
+                }
+                $result = $this->retireAbsorbedTask($other, $task, $kept, $target, (int) $finding['id'], $status);
+                if ($result !== []) {
+                    return $result;
+                }
+                $finding['status'] = $status;
             }
-            if (!$this->lockTask($task)) {
-                return [];
+        }
+
+        return [$finding, $kept];
+    }
+
+    private function adoptAbsorbedTask(array $finding, array $previous, array $absorbed, array $task, int $target, string $reference): array
+    {
+        $project = (int) $task['project_id'];
+        $oldProject = (int) ($previous['project_id'] ?? $project);
+
+        return (new FindingModel($this->db->getConnection()))->transaction(function () use (
+            $finding, $previous, $absorbed, $task, $project, $oldProject, $target, $reference,
+        ): array {
+            if (!$this->lockPrivateProjects($target, $project, $oldProject)) {
+                return ['unavailable' => $this->privateProject($project) === [] ? $project : $oldProject];
+            }
+            if (($previous !== [] && !$this->lockTask($previous)) || !$this->lockTask($task)) {
+                return ['retry' => true];
             }
 
             $id = (int) $task['id'];
-            $this->commentOnce($id, "Merged into #$survivorTask.");
+            $status = $task['is_active'] ? 'open' : 'dismissed';
+            $personReopened = $task['is_active']
+                ? ($absorbed['reopened_by_person_at'] ?? ($absorbed['closed_by_gumshoe_at'] !== null ? time() : null))
+                : null;
+            $claimWhere = $finding['task_id'] === null ? 'IS NULL' : '= ?';
+            $claim = $this->sql(
+                'UPDATE gumshoe_findings SET task_id = ?, project_id = ?, status = ?, closed_by_gumshoe_at = ?,
+                 reopened_by_person_at = ?, last_synced_at = ?, observed_priority = ?, observed_malware = ?, observed_kev = ?, observed_status = ?
+                 WHERE id = ? AND task_id '.$claimWhere,
+                [
+                    $id, $project, $status, $task['is_active'] ? null : $absorbed['closed_by_gumshoe_at'], $personReopened,
+                    $finding['last_synced_at'] ?? $absorbed['last_synced_at'],
+                    $finding['observed_priority'] ?? $absorbed['observed_priority'],
+                    $finding['observed_malware'] ?? $absorbed['observed_malware'],
+                    $finding['observed_kev'] ?? $absorbed['observed_kev'],
+                    $finding['observed_status'] ?? $absorbed['observed_status'], $finding['id'],
+                    ...($finding['task_id'] === null ? [] : [$finding['task_id']]),
+                ],
+            );
+            $this->check($claim->rowCount() === 1, 'claim absorbed task');
+
+            $affected = count(array_filter($this->repos((int) $finding['id']), static fn (array $repo): bool => $repo['state'] === 'affected'));
+            if ($affected === 0 && preg_match('/\(([1-9][0-9]*) repos?\)$/D', $task['title'], $match)) {
+                $affected = (int) $match[1];
+            }
+            $title = TaskText::title($finding['package'], $finding['primary_id'], max(1, $affected));
+            $this->check($this->taskModificationModel->update([
+                'id' => $id, 'reference' => $reference, 'title' => $title,
+            ]), 'adopt absorbed task');
+            if ($previous !== []) {
+                $this->commentOnce((int) $previous['id'], "Merged into #$id.");
+            }
+            $this->sql('UPDATE gumshoe_findings SET task_id = NULL WHERE id = ?', [$absorbed['id']]);
+
+            $updated = $this->sql('SELECT * FROM gumshoe_findings WHERE id = ?', [$finding['id']])->fetch(PDO::FETCH_ASSOC);
+
+            return [$updated + $finding, ['reference' => $reference, 'title' => $title] + $task];
+        });
+    }
+
+    private function retireAbsorbedTask(array $finding, array $task, array $kept, int $target, int $survivor, string $status): array
+    {
+        $project = (int) $task['project_id'];
+        $keptProject = (int) $kept['project_id'];
+
+        return (new FindingModel($this->db->getConnection()))->transaction(function () use (
+            $finding, $task, $kept, $target, $project, $keptProject, $survivor, $status,
+        ): array {
+            if (!$this->lockPrivateProjects($target, $project, $keptProject)) {
+                return ['unavailable' => $this->privateProject($project) === [] ? $project : $keptProject];
+            }
+            if (!$this->lockTask($kept) || !$this->lockTask($task)) {
+                return ['retry' => true];
+            }
+
+            $id = (int) $task['id'];
+            $this->commentOnce($id, "Merged into #{$kept['id']}.");
             $closeTime = $finding['closed_by_gumshoe_at'];
             if ($task['is_active']) {
                 $this->check($this->taskStatusModel->close($id), 'close merged task');
                 $closeTime = (int) $this->taskFinderModel->getById($id)['date_completed'];
             }
             $this->sql('UPDATE gumshoe_findings SET task_id = ?, project_id = ?, closed_by_gumshoe_at = ? WHERE id = ?',
-                [$id, $task['project_id'], $closeTime, $finding['id']]);
+                [$id, $project, $closeTime, $finding['id']]);
+            $this->sql('UPDATE gumshoe_findings SET status = ? WHERE id = ?', [$status, $survivor]);
 
             return [];
         });
+    }
 
-        return isset($result['unavailable']) ? $this->unavailable($runId, $targetProject, $result['unavailable']) : null;
+    private function hasMergeComment(int $taskId): bool
+    {
+        return $this->sql('SELECT id FROM comments WHERE task_id = ? AND user_id = 0 AND comment LIKE ? LIMIT 1',
+            [$taskId, self::MERGED_COMMENT_PATTERN])->fetchColumn() !== false;
+    }
+
+    private function syncMerged(array $finding, int $targetProject, int $runId): ?string
+    {
+        $group = (int) $finding['merged_into'];
+        $seen = [(int) $finding['group_id'] => true];
+        while ($group > 0 && !isset($seen[$group])) {
+            $seen[$group] = true;
+            $next = $this->sql('SELECT merged_into FROM gumshoe_groups WHERE id = ?', [$group])->fetchColumn();
+            if ($next === null) {
+                $survivor = (int) $this->sql("SELECT id FROM gumshoe_findings WHERE group_id = ? AND ecosystem = ? AND package = ? AND status <> 'merged'",
+                    [$group, $finding['ecosystem'], $finding['package']])->fetchColumn();
+                $this->check($survivor > 0, 'find merge survivor');
+
+                return $this->sync($survivor, $targetProject, $runId);
+            }
+            $group = (int) $next;
+        }
+
+        throw new RuntimeException('Invalid advisory group merge chain.');
     }
 
     private function privateProject(int $projectId): array
@@ -520,9 +583,9 @@ final class BoardSync extends Base
         return $project !== [] && (int) $project['is_public'] === 0 ? $project : [];
     }
 
-    private function lockPrivateProjects(int $target, int $actual): bool
+    private function lockPrivateProjects(int ...$projects): bool
     {
-        $ids = array_unique([$target, $actual]);
+        $ids = array_unique($projects);
         sort($ids);
         foreach ($ids as $id) {
             if ($this->forUpdate() === '') {
